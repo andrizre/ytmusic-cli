@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ytmusic-cli"
+version = "0.1.0"
+description = "YouTube Music CLI sederhana: search + stream playback"
+requires-python = ">=3.10"
+dependencies = ["ytmusicapi>=1.11", "yt-dlp>=2024.8.0"]
+
+[project.scripts]
+ytmusic = "ytmusic_cli.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ytmusic_cli*"]
