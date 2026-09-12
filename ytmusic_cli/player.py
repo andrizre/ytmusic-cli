@@ -2,6 +2,8 @@ import json
 import os
 import shutil
 import subprocess
+import time
+import urllib.parse
 
 import yt_dlp
 
@@ -19,12 +21,42 @@ if os.name == "nt" and not shutil.which("mpv"):
             break
 
 
+_STREAM_CACHE: dict[str, tuple[str, float]] = {}  # key video/url → (stream_url, valid_sampai)
+
+
+def _cache_key(video_id_or_url: str, url: str) -> str:
+    if len(video_id_or_url) == 11:
+        return video_id_or_url
+    v = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get("v", [""])
+    return v[0] or url
+
+
+def _cache_put(key: str, stream_url: str) -> None:
+    # googlevideo URL membawa ?expire=... (umur ~6 jam); cache sampai 60 dtk sebelumnya.
+    try:
+        exp = float(
+            urllib.parse.parse_qs(urllib.parse.urlsplit(stream_url).query).get(
+                "expire", [""]
+            )[0]
+        )
+    except ValueError:
+        return
+    if exp > time.time() + 60:
+        if len(_STREAM_CACHE) > 64:
+            _STREAM_CACHE.clear()
+        _STREAM_CACHE[key] = (stream_url, exp - 60)
+
+
 def resolve_stream_url(video_id_or_url: str) -> str:
     url = video_id_or_url
     if len(video_id_or_url) == 11 and all(
         c.isalnum() or c in "-_" for c in video_id_or_url
     ):
         url = f"https://music.youtube.com/watch?v={video_id_or_url}"
+    key = _cache_key(video_id_or_url, url)
+    hit = _STREAM_CACHE.get(key)
+    if hit and hit[1] > time.time():
+        return hit[0]
     opts = {
         "format": "bestaudio/best",
         "quiet": True,
@@ -40,9 +72,11 @@ def resolve_stream_url(video_id_or_url: str) -> str:
         info = ydl.extract_info(url, download=False)
     direct = info.get("url")
     if direct:
+        _cache_put(key, direct)
         return direct
     for fmt in info.get("requested_formats") or []:
         if fmt.get("acodec") != "none" and fmt.get("url"):
+            _cache_put(key, fmt["url"])
             return fmt["url"]
     raise RuntimeError("tidak ada stream audio")
 
@@ -82,21 +116,12 @@ def start_player(stream_url: str, ipc_path: str | None = None) -> subprocess.Pop
     )
 
 
-def suspend_process(proc: subprocess.Popen) -> bool:
-    """Bekukan proses player (jeda). True bila berhasil."""
-    if proc.poll() is not None:
-        return False
-    if os.name == "posix":
-        import signal
-
-        proc.send_signal(signal.SIGSTOP)
-        return True
+def _for_each_thread(pid: int, action) -> bool:
+    """Jalankan action(kernel32, handle) untuk tiap thread milik pid. False bila snapshot gagal."""
     import ctypes
     from ctypes import wintypes
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    TH32CS_SNAPTHREAD = 0x00000004
-    THREAD_SUSPEND_RESUME = 0x0002
 
     class THREADENTRY32(ctypes.Structure):
         _fields_ = [
@@ -109,7 +134,7 @@ def suspend_process(proc: subprocess.Popen) -> bool:
             ("dwFlags", wintypes.DWORD),
         ]
 
-    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+    snap = kernel32.CreateToolhelp32Snapshot(0x00000004, 0)  # TH32CS_SNAPTHREAD
     if snap == wintypes.HANDLE(-1).value:
         return False
     try:
@@ -117,15 +142,34 @@ def suspend_process(proc: subprocess.Popen) -> bool:
         te.dwSize = ctypes.sizeof(THREADENTRY32)
         ok = kernel32.Thread32First(snap, ctypes.byref(te))
         while ok:
-            if te.th32OwnerProcessID == proc.pid:
-                h = kernel32.OpenThread(THREAD_SUSPEND_RESUME, False, te.th32ThreadID)
+            if te.th32OwnerProcessID == pid:
+                h = kernel32.OpenThread(0x0002, False, te.th32ThreadID)  # THREAD_SUSPEND_RESUME
                 if h:
-                    kernel32.SuspendThread(h)
-                    kernel32.CloseHandle(h)
+                    try:
+                        action(kernel32, h)
+                    finally:
+                        kernel32.CloseHandle(h)
             ok = kernel32.Thread32Next(snap, ctypes.byref(te))
     finally:
         kernel32.CloseHandle(snap)
     return True
+
+
+def suspend_process(proc: subprocess.Popen) -> bool:
+    """Bekukan proses player (jeda). True bila berhasil."""
+    if proc.poll() is not None:
+        return False
+    if os.name == "posix":
+        import signal
+
+        proc.send_signal(signal.SIGSTOP)
+        return True
+    return _for_each_thread(proc.pid, lambda k, h: k.SuspendThread(h))
+
+
+def _resume_one(kernel32, h) -> None:
+    while kernel32.ResumeThread(h) > 1:
+        pass
 
 
 def resume_process(proc: subprocess.Popen) -> bool:
@@ -137,42 +181,7 @@ def resume_process(proc: subprocess.Popen) -> bool:
 
         proc.send_signal(signal.SIGCONT)
         return True
-    import ctypes
-    from ctypes import wintypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    TH32CS_SNAPTHREAD = 0x00000004
-    THREAD_SUSPEND_RESUME = 0x0002
-
-    class THREADENTRY32(ctypes.Structure):
-        _fields_ = [
-            ("dwSize", wintypes.DWORD),
-            ("cntUsage", wintypes.DWORD),
-            ("th32ThreadID", wintypes.DWORD),
-            ("th32OwnerProcessID", wintypes.DWORD),
-            ("tpBasePri", wintypes.LONG),
-            ("tpDeltaPri", wintypes.LONG),
-            ("dwFlags", wintypes.DWORD),
-        ]
-
-    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
-    if snap == wintypes.HANDLE(-1).value:
-        return False
-    try:
-        te = THREADENTRY32()
-        te.dwSize = ctypes.sizeof(THREADENTRY32)
-        ok = kernel32.Thread32First(snap, ctypes.byref(te))
-        while ok:
-            if te.th32OwnerProcessID == proc.pid:
-                h = kernel32.OpenThread(THREAD_SUSPEND_RESUME, False, te.th32ThreadID)
-                if h:
-                    while kernel32.ResumeThread(h) > 1:
-                        pass
-                    kernel32.CloseHandle(h)
-            ok = kernel32.Thread32Next(snap, ctypes.byref(te))
-    finally:
-        kernel32.CloseHandle(snap)
-    return True
+    return _for_each_thread(proc.pid, _resume_one)
 
 
 class MpvIpc:

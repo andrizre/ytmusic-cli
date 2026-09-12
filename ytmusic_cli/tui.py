@@ -71,9 +71,11 @@ def handle_key(st: State, key: str) -> str:
         return "quit"
     if key == UP and st.results:
         st.selected = (st.selected - 1) % len(st.results)
+        clamp_scroll(st)
         return ""
     if key == DOWN and st.results:
         st.selected = (st.selected + 1) % len(st.results)
+        clamp_scroll(st)
         return ""
     if key == ENTER:
         if st.dirty or not st.results:
@@ -95,8 +97,21 @@ def volume_bar(vol: int, width: int = 12) -> str:
     return f"[{'█' * fill}{'░' * (width - fill)}] {vol}"
 
 
+def _list_rows() -> int:
+    return min(shutil.get_terminal_size().lines - 4, 20)
+
+
+def clamp_scroll(st: State) -> None:
+    """Jaga selected tetap di dalam jendela scroll. Dipanggil saat selected/results berubah."""
+    rows = _list_rows()
+    if st.selected < st.scroll:
+        st.scroll = st.selected
+    elif st.selected >= st.scroll + rows:
+        st.scroll = st.selected - rows + 1
+
+
 def render(st: State) -> str:
-    rows = min(shutil.get_terminal_size().lines - 4, 20)
+    rows = _list_rows()
     out = [f"> Cari: {st.query}█", "─" * 40]
     if st.playing:
         flags = " ⏸ JEDA" if st.paused else ""
@@ -107,10 +122,6 @@ def render(st: State) -> str:
     elif not st.results:
         out.append("(belum ada hasil)")
     else:
-        if st.selected < st.scroll:
-            st.scroll = st.selected
-        elif st.selected >= st.scroll + rows:
-            st.scroll = st.selected - rows + 1
         for i, t in enumerate(st.results[st.scroll : st.scroll + rows], start=st.scroll):
             line = format_track(i + 1, t)
             out.append(f"\x1b[7m{line}\x1b[0m" if i == st.selected else line)
