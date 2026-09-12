@@ -62,6 +62,7 @@ class State:
     playing: str | None = None  # judul lagu yang sedang diputar
     paused: bool = False
     volume: int | None = None  # 0-130 (mpv) atau None bila tak diketahui
+    mpv_msg: str | None = None  # alasan IPC mpv gagal (None bila mpv tak dipakai / OK)
 
 
 def handle_key(st: State, key: str) -> str:
@@ -175,10 +176,14 @@ def _change_volume(st: State, ipc, delta: int) -> None:
     # Volume = volume milik proses mpv (per-aplikasi, master Windows tak tersentuh).
     # ffplay tidak punya API remote apa pun → butuh mpv.
     if ipc is None:
-        st.status = "Volume butuh mpv — install mpv (https://mpv.io), lalu putar ulang."
+        if st.mpv_msg:
+            st.status = f"Volume gagal: {st.mpv_msg} — putar ulang."
+        else:
+            st.status = "Volume butuh mpv — install mpv (https://mpv.io), lalu putar ulang."
         return
     try:
-        st.volume = int(ipc.command("add", "volume", delta))
+        ipc.command("add", "volume", delta)  # return-nya null → baca ulang
+        st.volume = int(ipc.get_property("volume"))
     except Exception as e:
         st.status = f"Volume gagal: {e}"
 
@@ -196,12 +201,14 @@ def do_play(st: State) -> None:
         proc = start_player(url, ipc_path)
         ipc = None
         st.volume = None
+        st.mpv_msg = None
         if ipc_path:  # mpv di platform apa pun → volume per-aplikasi via IPC
             try:
                 ipc = MpvIpc.connect(ipc_path)
                 st.volume = int(ipc.get_property("volume"))
-            except Exception:
+            except Exception as e:
                 ipc = None  # lanjut tanpa volume control
+                st.mpv_msg = str(e) or "IPC mpv tak terbentuk"
     except Exception as e:
         st.status = f"Gagal memutar: {e}"
         return

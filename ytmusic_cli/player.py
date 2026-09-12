@@ -5,6 +5,19 @@ import subprocess
 
 import yt_dlp
 
+# winget (shinchiro build) menulis ke Program Files tapi sesi terminal lama
+# tidak melihat PATH baru → daftarkan lokasi umum agar which("mpv") tetap temu.
+if os.name == "nt" and not shutil.which("mpv"):
+    _candidates = [
+        r"C:\Program Files\MPV Player",
+        os.path.join(os.environ.get("ProgramFiles", ""), "MPV Player"),
+        os.path.join(os.environ.get("LocalAppData", ""), "Programs", "mpv"),
+    ]
+    for _d in dict.fromkeys(_candidates):
+        if _d and os.path.isfile(os.path.join(_d, "mpv.exe")):
+            os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + _d
+            break
+
 
 def resolve_stream_url(video_id_or_url: str) -> str:
     url = video_id_or_url
@@ -17,6 +30,11 @@ def resolve_stream_url(video_id_or_url: str) -> str:
         "quiet": True,
         "noplaylist": True,
         "no_warnings": True,
+        # HLS (m3u8) / DASH manifest sering timeout & bikin "Mengambil stream"
+        # stuck 30-60 dtk; audio langsung (https, itag 251/140) sudah cukup.
+        "extractor_args": {"youtube": {"skip": ["hls", "dash"]}},
+        "socket_timeout": 15,
+        "retries": 2,
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -173,7 +191,7 @@ class MpvIpc:
         deadline = time.time() + timeout
         while True:
             try:
-                if path.startswith(r"\\.\pipe\\"):
+                if path.startswith("\\\\.\\pipe\\"):
                     return cls(open(path, "r+b", buffering=0))
                 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 try:
