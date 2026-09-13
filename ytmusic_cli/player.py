@@ -7,6 +7,8 @@ import urllib.parse
 
 import yt_dlp
 
+from .models import Track
+
 # winget (shinchiro build) menulis ke Program Files tapi sesi terminal lama
 # tidak melihat PATH baru → daftarkan lokasi umum agar which("mpv") tetap temu.
 if os.name == "nt" and not shutil.which("mpv"):
@@ -24,11 +26,81 @@ if os.name == "nt" and not shutil.which("mpv"):
 _STREAM_CACHE: dict[str, tuple[str, float]] = {}  # key video/url → (stream_url, valid_sampai)
 
 
-def _cache_key(video_id_or_url: str, url: str) -> str:
-    if len(video_id_or_url) == 11:
+def _is_video_id(s: str) -> bool:
+    return len(s) == 11 and all(c.isalnum() or c in "-_" for c in s)
+
+
+def normalize_video_id(video_id_or_url: str, url: str | None = None) -> str:
+    """Normalisasi input play menjadi videoId 11 char bila bisa ditebak.
+
+    Menangani: id polos, watch?v=, youtu.be/<id>, /shorts|embed|v/<id>.
+    Fallback: kembalikan input apa adanya (mis. URL non-standar)."""
+    if _is_video_id(video_id_or_url):
         return video_id_or_url
-    v = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get("v", [""])
-    return v[0] or url
+    parsed = urllib.parse.urlsplit(url or video_id_or_url)
+    v = urllib.parse.parse_qs(parsed.query).get("v", [""])[0]
+    if _is_video_id(v):
+        return v
+    parts = [p for p in parsed.path.split("/") if p]
+    if parts and _is_video_id(parts[-1]):
+        return parts[-1]
+    return v or video_id_or_url
+
+
+def _cache_key(video_id_or_url: str, url: str) -> str:
+    return normalize_video_id(video_id_or_url, url)
+
+
+def _watch_url(video_id_or_url: str) -> str:
+    if _is_video_id(video_id_or_url):
+        return f"https://music.youtube.com/watch?v={video_id_or_url}"
+    return video_id_or_url
+
+
+def format_duration(seconds: float | int | None) -> str | None:
+    """Detik → 'm:ss' / 'h:mm:ss'. None/invalid → None."""
+    if seconds is None:
+        return None
+    try:
+        total = int(seconds)
+    except (TypeError, ValueError):
+        return None
+    if total < 0:
+        return None
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def _clean_artist(name: str | None) -> str | None:
+    if not name:
+        return None
+    name = name.strip()
+    if name.endswith(" - Topic"):
+        name = name[: -len(" - Topic")].strip()
+    return name or None
+
+
+def track_from_info(info: dict, fallback_id: str) -> Track:
+    """Bangun Track dari info dict yt-dlp. Murni (mudah dites)."""
+    vid = info.get("id") or fallback_id
+    title = info.get("title") or vid
+    artists = (
+        info.get("artist")
+        or info.get("creator")
+        or _clean_artist(info.get("uploader"))
+        or info.get("channel")
+        or "Unknown"
+    )
+    return Track(
+        video_id=vid,
+        title=title,
+        artists=artists,
+        duration=format_duration(info.get("duration")),
+        album=info.get("album"),
+    )
 
 
 def _cache_put(key: str, stream_url: str) -> None:
@@ -47,17 +119,8 @@ def _cache_put(key: str, stream_url: str) -> None:
         _STREAM_CACHE[key] = (stream_url, exp - 60)
 
 
-def resolve_stream_url(video_id_or_url: str) -> str:
-    url = video_id_or_url
-    if len(video_id_or_url) == 11 and all(
-        c.isalnum() or c in "-_" for c in video_id_or_url
-    ):
-        url = f"https://music.youtube.com/watch?v={video_id_or_url}"
-    key = _cache_key(video_id_or_url, url)
-    hit = _STREAM_CACHE.get(key)
-    if hit and hit[1] > time.time():
-        return hit[0]
-    opts = {
+def _ydl_opts() -> dict:
+    return {
         "format": "bestaudio/best",
         "quiet": True,
         "noplaylist": True,
@@ -68,8 +131,17 @@ def resolve_stream_url(video_id_or_url: str) -> str:
         "socket_timeout": 15,
         "retries": 2,
     }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+
+
+def fetch_info(video_id_or_url: str) -> dict:
+    """Ambil info dict yt-dlp sekali (dipakai untuk stream URL + metadata)."""
+    url = _watch_url(video_id_or_url)
+    with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+def stream_url_from_info(info: dict, key: str) -> str:
+    """Pilih stream audio dari info dict + cache. Raise bila tak ada."""
     direct = info.get("url")
     if direct:
         _cache_put(key, direct)
@@ -79,6 +151,40 @@ def resolve_stream_url(video_id_or_url: str) -> str:
             _cache_put(key, fmt["url"])
             return fmt["url"]
     raise RuntimeError("tidak ada stream audio")
+
+
+def resolve_stream_url(video_id_or_url: str) -> str:
+    url = _watch_url(video_id_or_url)
+    key = _cache_key(video_id_or_url, url)
+    hit = _STREAM_CACHE.get(key)
+    if hit and hit[1] > time.time():
+        return hit[0]
+    return stream_url_from_info(fetch_info(video_id_or_url), key)
+
+
+def resolve_stream_and_track(video_id_or_url: str) -> tuple[str, Track]:
+    """Satu fetch yt-dlp → (stream_url, Track). Cache stream tetap dipakai bila hit."""
+    url = _watch_url(video_id_or_url)
+    key = _cache_key(video_id_or_url, url)
+    vid = normalize_video_id(video_id_or_url, url)
+    hit = _STREAM_CACHE.get(key)
+    if hit and hit[1] > time.time():
+        try:
+            return hit[0], track_from_info(fetch_info(video_id_or_url), vid)
+        except Exception:
+            return hit[0], Track(video_id=vid, title=vid, artists="Unknown", duration=None, album=None)
+    info = fetch_info(video_id_or_url)
+    return stream_url_from_info(info, key), track_from_info(info, vid)
+
+
+def resolve_track(video_id_or_url: str) -> Track:
+    """Metadata lagu untuk riwayat. Fallback: Track minimal agar play tetap tercatat."""
+    url = _watch_url(video_id_or_url)
+    vid = normalize_video_id(video_id_or_url, url)
+    try:
+        return resolve_stream_and_track(video_id_or_url)[1]
+    except Exception:
+        return Track(video_id=vid, title=vid, artists="Unknown", duration=None, album=None)
 
 
 def player_cmd(stream_url: str) -> list[str]:
@@ -102,6 +208,12 @@ def play_stream(stream_url: str) -> int:
 
 def play_track(video_id_or_url: str) -> int:
     return play_stream(resolve_stream_url(video_id_or_url))
+
+
+def play_with_metadata(video_id_or_url: str) -> tuple[int, Track]:
+    """Putar + kembalikan metadata (satu fetch). Raise bila resolve/play gagal."""
+    stream_url, track = resolve_stream_and_track(video_id_or_url)
+    return play_stream(stream_url), track
 
 def start_player(stream_url: str, ipc_path: str | None = None) -> subprocess.Popen:
     """Luncurkan player tanpa mewarisi stdio (untuk TUI). Tambah IPC server bila mpv."""

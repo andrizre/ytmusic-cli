@@ -1,9 +1,8 @@
 import argparse
 import sys
 
-from .models import Track, format_track
-from .player import play_track
-from .search import search_tracks
+from .models import format_track
+from .player import play_with_metadata
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -78,17 +77,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "play":
         print(f"Memutar {args.input} ... (Ctrl-C untuk berhenti)", file=sys.stderr)
         try:
-            rc = play_track(args.input)
+            rc, track = play_with_metadata(args.input)
         except Exception as e:
             print(f"Gagal memutar: {e}", file=sys.stderr)
             return 1
         if rc == 0:
             try:
                 from .history import add_history
-                from .player import _cache_key
 
-                vid = _cache_key(args.input, args.input)
-                add_history(Track(video_id=vid, title=vid, artists="Unknown", duration=None, album=None))
+                add_history(track)
             except Exception:
                 pass
         return rc
