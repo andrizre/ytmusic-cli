@@ -1,8 +1,8 @@
 """TUI stdlib-only untuk ytmusic-cli (Windows + POSIX).
 
 Kontrol: ketik query + Enter = cari | ↑↓ = pilih | Enter = putar |
-spasi = jeda/lanjut | -/+ = volume (butuh mpv) | tombol lain saat
-memutar = berhenti | Esc / Ctrl-C = keluar.
+Ctrl+R = riwayat (↑↓ pilih, Enter putar) | spasi = jeda/lanjut |
+-/+ = volume (butuh mpv) | tombol lain saat memutar = berhenti | Esc / Ctrl-C = keluar.
 """
 
 import os
@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass, field
 
 from .models import Track, format_track
+from .history import HistoryEntry, add_history, format_history_entry, load_history
 from .player import MpvIpc, player_cmd, resolve_stream_url, resume_process, start_player, suspend_process
 from .search import search_tracks
 
@@ -25,6 +26,7 @@ except ImportError:
     _WINDOWS = False
 
 UP, DOWN, ENTER, ESC, BACKSPACE = "up", "down", "enter", "esc", "backspace"
+CTRL_R = "\x12"  # Ctrl+R = tampilkan/sembunyikan panel riwayat
 
 
 def read_key() -> str:
@@ -63,29 +65,47 @@ class State:
     paused: bool = False
     volume: int | None = None  # 0-130 (mpv) atau None bila tak diketahui
     mpv_msg: str | None = None  # alasan IPC mpv gagal (None bila mpv tak dipakai / OK)
+    history: list[HistoryEntry] = field(default_factory=list)  # riwayat putar (cache 30 hari / 30 lagu)
+    show_history: bool = False  # panel riwayat aktif (Ctrl+R): ↑↓ + Enter putar
 
 
 def handle_key(st: State, key: str) -> str:
-    """Logika murni: ubah state dari satu tombol. Kembalikan aksi: '', 'search', 'play', 'quit'."""
+    """Logika murni: ubah state dari satu tombol. Kembalikan aksi: '', 'search', 'play', 'history', 'quit'."""
+    if key == CTRL_R:
+        return "history"
     if key == ESC or key == "\x03":
+        if st.show_history:
+            st.show_history = False
+            st.selected = 0
+            st.scroll = 0
+            return ""
         return "quit"
-    if key == UP and st.results:
-        st.selected = (st.selected - 1) % len(st.results)
+    n = len(st.history) if st.show_history else len(st.results)
+    if key == UP and n:
+        st.selected = (st.selected - 1) % n
         clamp_scroll(st)
         return ""
-    if key == DOWN and st.results:
-        st.selected = (st.selected + 1) % len(st.results)
+    if key == DOWN and n:
+        st.selected = (st.selected + 1) % n
         clamp_scroll(st)
         return ""
     if key == ENTER:
+        if st.show_history and st.history:
+            return "play"
         if st.dirty or not st.results:
             return "search"
         return "play"
     if key == BACKSPACE:
+        st.show_history = False
+        st.selected = 0
+        st.scroll = 0
         st.query = st.query[:-1]
         st.dirty = True
         return ""
     if len(key) == 1 and key.isprintable():
+        st.show_history = False
+        st.selected = 0
+        st.scroll = 0
         st.query += key
         st.dirty = True
         return ""
@@ -119,15 +139,52 @@ def render(st: State) -> str:
         if st.volume is not None:
             out.append(f"Volume: {volume_bar(st.volume)}   ( - / + )")
         out.append("(spasi=jeda | -/+=volume | tombol lain=berhenti)")
+    elif st.show_history:
+        out.append(f"Riwayat terakhir ({len(st.history)}) — ↑↓ pilih, Enter putar:")
+        for i, h in enumerate(st.history[st.scroll : st.scroll + rows], start=st.scroll):
+            line = format_history_entry(i + 1, h)
+            out.append(f"\x1b[7m{line}\x1b[0m" if i == st.selected else line)
     elif not st.results:
-        out.append("(belum ada hasil)")
+        out.append("(belum ada hasil — Ctrl+R untuk riwayat)")
     else:
         for i, t in enumerate(st.results[st.scroll : st.scroll + rows], start=st.scroll):
             line = format_track(i + 1, t)
             out.append(f"\x1b[7m{line}\x1b[0m" if i == st.selected else line)
     out.append("─" * 40)
-    out.append(f"{st.status}  [↑↓ pilih | Enter cari/putar | Esc keluar]")
+    out.append(f"{st.status}  [↑↓ pilih | Enter cari/putar | Ctrl+R riwayat | Esc keluar]")
     return "\n".join(out)
+
+
+def _current_track(st: State) -> Track:
+    """Lagu terpilih dari daftar aktif: riwayat (mode Ctrl+R) atau hasil search."""
+    if st.show_history:
+        e = st.history[st.selected]
+        return Track(
+            video_id=e.video_id, title=e.title, artists=e.artists, duration=e.duration, album=e.album
+        )
+    return st.results[st.selected]
+
+
+def do_history(st: State) -> None:
+    """Toggle panel riwayat (Ctrl+R): muat ulang cache, siap ↑↓ + Enter putar."""
+    if st.show_history:
+        st.show_history = False
+        st.selected = 0
+        st.scroll = 0
+        st.status = "Kembali ke hasil pencarian."
+        return
+    try:
+        st.history = load_history()
+    except Exception as e:
+        st.status = f"Riwayat gagal dibaca: {e}"
+        return
+    if not st.history:
+        st.status = "Belum ada riwayat."
+        return
+    st.show_history = True
+    st.selected = 0
+    st.scroll = 0
+    st.status = f"{len(st.history)} lagu di riwayat — ↑↓ pilih, Enter putar."
 
 
 def do_search(st: State) -> None:
@@ -200,7 +257,7 @@ def _change_volume(st: State, ipc, delta: int) -> None:
 
 
 def do_play(st: State) -> None:
-    track = st.results[st.selected]
+    track = _current_track(st)
     st.status = f"Mengambil stream {track.title} ..."
     print(f"\x1b[2J\x1b[H{render(st)}", end="", flush=True)
     try:
@@ -226,6 +283,14 @@ def do_play(st: State) -> None:
     st.playing = f"{track.title} — {track.artists}"
     st.paused = False
     st.status = f"Memutar {track.title} ..."
+    try:
+        st.history = add_history(track)
+        if st.show_history:
+            st.selected = 0
+            st.scroll = 0
+    except Exception:
+        pass
+
     print(f"\x1b[2J\x1b[H{render(st)}", end="", flush=True)
     while proc.poll() is None:
         key = _wait_key()
@@ -252,6 +317,10 @@ def do_play(st: State) -> None:
 
 def run_tui() -> int:
     st = State()
+    try:
+        st.history = load_history()
+    except Exception:
+        st.history = []
     print("\x1b[?25l", end="", flush=True)  # sembunyikan kursor
     try:
         while True:
@@ -262,7 +331,9 @@ def run_tui() -> int:
                 return 0
             if action == "quit":
                 return 0
-            if action == "search":
+            if action == "history":
+                do_history(st)
+            elif action == "search":
                 print(f"\x1b[2J\x1b[H{render(st)}", end="", flush=True)
                 do_search(st)
             elif action == "play":

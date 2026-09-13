@@ -1,7 +1,9 @@
 """Tes fungsi murni ytmusic-cli (stdlib only, tanpa network/proses Audio)."""
 
+import os
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 
@@ -14,14 +16,25 @@ from ytmusic_cli.player import (
     resume_process,
     suspend_process,
 )
+from ytmusic_cli.history import (
+    HistoryEntry,
+    add_history,
+    clear_history,
+    format_history_entry,
+    load_history,
+    prune_history,
+)
 from ytmusic_cli.tui import (
     BACKSPACE,
+    CTRL_R,
     DOWN,
     ENTER,
     ESC,
     UP,
     State,
+    _current_track,
     clamp_scroll,
+    do_history,
     handle_key,
     playing_action,
     render,
@@ -157,6 +170,115 @@ class SuspendResumeTest(unittest.TestCase):
         self.assertFalse(suspend_process(proc))
         self.assertFalse(resume_process(proc))
 
+
+class HistoryTest(unittest.TestCase):
+    def _entry(self, vid: str, age_days: float = 0) -> HistoryEntry:
+        return HistoryEntry(
+            video_id=vid,
+            title=f"Judul {vid}",
+            artists="Artis",
+            played_at=time.time() - age_days * 86400,
+        )
+
+    def test_lebih_tua_dari_30_hari_dibuang(self):
+        entries = [self._entry("baru"), self._entry("lama", age_days=31)]
+        out = prune_history(entries)
+        self.assertEqual([e.video_id for e in out], ["baru"])
+
+    def test_dipotong_30_lagu_terbaru(self):
+        entries = [self._entry(f"vid{i:08d}") for i in range(35)]
+        out = prune_history(entries)
+        self.assertEqual(len(out), 30)
+        self.assertEqual(out[0].video_id, "vid00000000")
+
+    def test_duplikat_video_id_hanya_terbaru(self):
+        entries = [self._entry("sama"), self._entry("sama")]
+        self.assertEqual(len(prune_history(entries)), 1)
+
+    def test_add_simpan_muat_bulat_dan_dedupe(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = f"{d}/history.json"
+            add_history(_track(1), path=p)
+            add_history(_track(2), path=p)
+            add_history(_track(1), path=p)  # putar ulang → ke depan, tanpa duplikat
+            loaded = load_history(p)
+            self.assertEqual([e.video_id for e in loaded], ["vid00000001", "vid00000002"])
+            s = format_history_entry(1, loaded[0])
+            self.assertIn("vid00000001", s)
+
+    def test_file_rusak_jadi_kosong_dan_clear_hapus(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = f"{d}/history.json"
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("{bukan json")
+            self.assertEqual(load_history(p), [])
+            add_history(_track(3), path=p)
+            clear_history(p)
+            self.assertEqual(load_history(p), [])
+
+
+
+class HistoryModeTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old = os.environ.get("YTMUSIC_CLI_HISTORY_FILE")
+        os.environ["YTMUSIC_CLI_HISTORY_FILE"] = f"{self._tmp.name}/history.json"
+        add_history(_track(1))
+        add_history(_track(2))
+
+    def tearDown(self):
+        if self._old is None:
+            os.environ.pop("YTMUSIC_CLI_HISTORY_FILE", None)
+        else:
+            os.environ["YTMUSIC_CLI_HISTORY_FILE"] = self._old
+        self._tmp.cleanup()
+
+    def test_ctrl_r_minta_aksi_history(self):
+        self.assertEqual(handle_key(State(), CTRL_R), "history")
+
+    def test_toggle_masuk_lalu_keluar(self):
+        st = State()
+        do_history(st)
+        self.assertTrue(st.show_history)
+        self.assertEqual(len(st.history), 2)
+        do_history(st)
+        self.assertFalse(st.show_history)
+
+    def test_enter_putar_dan_navigasi_wrap_di_riwayat(self):
+        st = State()
+        do_history(st)
+        self.assertEqual(handle_key(st, ENTER), "play")
+        handle_key(st, DOWN)
+        self.assertEqual(st.selected, 1)
+        handle_key(st, DOWN)
+        self.assertEqual(st.selected, 0)  # wrap dalam 2 entri riwayat
+        handle_key(st, UP)
+        self.assertEqual(st.selected, 1)
+
+    def test_ketik_dan_esc_keluar_dari_mode(self):
+        st = State()
+        do_history(st)
+        handle_key(st, "x")
+        self.assertFalse(st.show_history)
+        self.assertTrue(st.dirty)
+        do_history(st)
+        self.assertEqual(handle_key(st, ESC), "")
+        self.assertFalse(st.show_history)
+        self.assertEqual(handle_key(st, ESC), "quit")
+
+    def test_current_track_dari_riwayat(self):
+        st = State()
+        do_history(st)
+        st.selected = 1
+        t = _current_track(st)
+        self.assertEqual(t.video_id, "vid00000001")
+
+    def test_render_mode_riwayat_tandai_pilihan(self):
+        st = State()
+        do_history(st)
+        out = render(st)
+        self.assertIn("Riwayat terakhir (2)", out)
+        self.assertIn("\x1b[7m", out)
 
 if __name__ == "__main__":
     unittest.main()
