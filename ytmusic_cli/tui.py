@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 
 from .models import Track, format_track
 from .history import HistoryEntry, add_history, format_history_entry, load_history
-from .player import MpvIpc, player_cmd, resolve_stream_url, resume_process, start_player, suspend_process
+from .player import MpvIpc, player_cmd, resolve_stream_url, resume_process, start_player, stop_player, suspend_process
 from .search import search_tracks
 
 try:
@@ -262,7 +262,7 @@ def do_play(st: State) -> None:
     print(f"\x1b[2J\x1b[H{render(st)}", end="", flush=True)
     try:
         url = resolve_stream_url(track.video_id)
-        use_mpv = player_cmd(url)[0] == "mpv"
+        use_mpv = os.path.basename(player_cmd(url)[0]).lower().startswith("mpv")
         ipc_path = (r"\\.\pipe\ytmusic-%d" % os.getpid()) if use_mpv else None
         if ipc_path and not _WINDOWS:
             ipc_path = tempfile.gettempdir() + "/ytmusic-%d.sock" % os.getpid()
@@ -292,24 +292,26 @@ def do_play(st: State) -> None:
         pass
 
     print(f"\x1b[2J\x1b[H{render(st)}", end="", flush=True)
-    while proc.poll() is None:
-        key = _wait_key()
-        action = playing_action(key)
-        if action == "pause":
-            _toggle_pause(st, proc, ipc)
-        elif action == "voldn":
-            _change_volume(st, ipc, -5)
-        elif action == "volup":
-            _change_volume(st, ipc, +5)
-        else:
-            break
-        print(f"\x1b[2J\x1b[H{render(st)}", end="", flush=True)
-    if proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+    try:
+        while proc.poll() is None:
+            key = _wait_key()
+            action = playing_action(key)
+            if action == "pause":
+                _toggle_pause(st, proc, ipc)
+            elif action == "voldn":
+                _change_volume(st, ipc, -5)
+            elif action == "volup":
+                _change_volume(st, ipc, +5)
+            else:
+                break
+            print(f"\x1b[2J\x1b[H{render(st)}", end="", flush=True)
+    finally:
+        stop_player(proc)
+        if ipc is not None:
+            try:
+                ipc.close()
+            except Exception:
+                pass
     st.playing = None
     st.paused = False
     st.status = "Berhenti. ↑↓ pilih lagu lain, Enter putar lagi."

@@ -187,9 +187,23 @@ def resolve_track(video_id_or_url: str) -> Track:
         return Track(video_id=vid, title=vid, artists="Unknown", duration=None, album=None)
 
 
+def _resolve_mpv() -> str | None:
+    """Path mpv, diutamakan mpv.exe asli (bukan mpv.com wrapper).
+
+    which("mpv") di Windows menang ke mpv.COM (urutan PATHEXT) — itu hanya
+    wrapper console yang melahirkan mpv.exe anak. Luncurkan mpv.exe langsung
+    agar job kill-on-close mengikat proses audio yang sebenarnya.
+    """
+    exe = shutil.which("mpv.exe")
+    if exe:
+        return exe
+    return shutil.which("mpv")
+
+
 def player_cmd(stream_url: str) -> list[str]:
-    if shutil.which("mpv"):
-        return ["mpv", "--no-video", stream_url]
+    mpv = _resolve_mpv()
+    if mpv:
+        return [mpv, "--no-video", stream_url]
     if shutil.which("ffplay"):
         return ["ffplay", "-nodisp", "-autoexit", stream_url]
     raise RuntimeError(
@@ -199,11 +213,15 @@ def player_cmd(stream_url: str) -> list[str]:
 
 
 def play_stream(stream_url: str) -> int:
+    proc = subprocess.Popen(player_cmd(stream_url))
+    _attach_kill_on_parent_exit(proc)
     try:
-        result = subprocess.run(player_cmd(stream_url))
+        return proc.wait()
     except KeyboardInterrupt:
+        stop_player(proc)
         return 0
-    return result.returncode
+    finally:
+        stop_player(proc)
 
 
 def play_track(video_id_or_url: str) -> int:
@@ -215,17 +233,114 @@ def play_with_metadata(video_id_or_url: str) -> tuple[int, Track]:
     stream_url, track = resolve_stream_and_track(video_id_or_url)
     return play_stream(stream_url), track
 
+
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+
+
+def _attach_kill_on_parent_exit(proc: subprocess.Popen) -> None:
+    """Ikat player ke Job Object KILL_ON_JOB_CLOSE (Windows saja).
+
+    Handle job disimpan di proc agar hidup selama player jalan: saat console
+    di-X, parent mati → handle tertutup → Windows membunuh player otomatis.
+    Bila assign gagal (mis. proses sudah di dalam job), handle job dilepas
+    agar tidak bocor; perilaku kembali seperti sebelumnya.
+    """
+    if os.name != "nt":
+        return
+    h_job = None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessCount", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", ctypes.c_byte * 48),  # JOBOBJECT_IO_RATE_CONTROL_INFORMATION
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        h_job = kernel32.CreateJobObjectW(None, None)
+        if not h_job:
+            return
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        # 9 = JobObjectExtendedLimitInformation (struct basic 2 ditolak: ERROR_INVALID_PARAMETER).
+        ok = kernel32.SetInformationJobObject(
+            h_job, 9, ctypes.byref(info), ctypes.sizeof(info)
+        )
+        handle = int(getattr(proc, "_handle", 0) or 0)
+        if ok and handle:
+            ok = kernel32.AssignProcessToJobObject(h_job, handle)
+        if ok:
+            proc._ytmusic_job = h_job  # noqa: SLF001 — jaga handle tetap terbuka
+            h_job = None  # kepemilikan pindah ke proc; jangan ditutup di finally
+    except Exception:
+        pass
+    finally:
+        if h_job:
+            try:
+                import ctypes
+
+                ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(h_job)
+            except Exception:
+                pass
+
+
+def stop_player(proc: subprocess.Popen, timeout: float = 5) -> None:
+    """Hentikan player + tutup handle job. Aman dipanggil berkali-kali."""
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    finally:
+        h_job = getattr(proc, "_ytmusic_job", None)
+        if h_job:
+            try:
+                import ctypes
+
+                ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(h_job)
+            except Exception:
+                pass
+            finally:
+                try:
+                    del proc._ytmusic_job  # noqa: SLF001
+                except AttributeError:
+                    pass
+
+
 def start_player(stream_url: str, ipc_path: str | None = None) -> subprocess.Popen:
     """Luncurkan player tanpa mewarisi stdio (untuk TUI). Tambah IPC server bila mpv."""
     cmd = player_cmd(stream_url)
-    if ipc_path and cmd[0] == "mpv":
+    if ipc_path and os.path.basename(cmd[0]).lower().startswith("mpv"):
         cmd = [cmd[0], f"--input-ipc-server={ipc_path}", *cmd[1:]]
-    return subprocess.Popen(
+    proc = subprocess.Popen(
         cmd,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    _attach_kill_on_parent_exit(proc)
+    return proc
 
 
 def _for_each_thread(pid: int, action) -> bool:
@@ -352,3 +467,9 @@ class MpvIpc:
 
     def set_property(self, name: str, value) -> None:
         self.command("set_property", name, value)
+
+    def close(self) -> None:
+        try:
+            self._f.close()
+        except Exception:
+            pass
