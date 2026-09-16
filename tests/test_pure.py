@@ -36,6 +36,8 @@ from ytmusic_cli.tui import (
     DOWN,
     ENTER,
     ESC,
+    LEFT,
+    RIGHT,
     UP,
     State,
     _current_track,
@@ -111,9 +113,18 @@ class PlayingActionTest(unittest.TestCase):
         self.assertEqual(playing_action("-"), "voldn")
         self.assertEqual(playing_action("+"), "volup")
         self.assertEqual(playing_action("="), "volup")
+        self.assertEqual(playing_action(LEFT), "seekback")
+        self.assertEqual(playing_action(RIGHT), "seekfwd")
         self.assertEqual(playing_action("q"), "stop")
-        self.assertEqual(playing_action(UP), "stop")
+        self.assertEqual(playing_action("Q"), "stop")
+        self.assertEqual(playing_action(ESC), "stop")
+        self.assertEqual(playing_action("\x03"), "stop")
 
+    def test_tombol_asing_diabaikan_bukan_stop(self):
+        self.assertEqual(playing_action(UP), "")
+        self.assertEqual(playing_action(DOWN), "")
+        self.assertEqual(playing_action("a"), "")
+        self.assertEqual(playing_action("*"), "")
 
 class FormatTrackTest(unittest.TestCase):
     def test_durasi_none_jadi_tanya(self):

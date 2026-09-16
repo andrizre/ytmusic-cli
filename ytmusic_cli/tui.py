@@ -2,7 +2,8 @@
 
 Kontrol: ketik query + Enter = cari | ↑↓ = pilih | Enter = putar |
 Ctrl+R = riwayat (↑↓ pilih, Enter putar) | spasi = jeda/lanjut |
--/+ = volume (butuh mpv) | tombol lain saat memutar = berhenti | Esc / Ctrl-C = keluar.
+-/+ = volume (butuh mpv) | ←/→ = seek -5/+5 dtk (butuh mpv) |
+q / Esc = berhenti | Esc di daftar = keluar.
 """
 
 import os
@@ -25,7 +26,7 @@ try:
 except ImportError:
     _WINDOWS = False
 
-UP, DOWN, ENTER, ESC, BACKSPACE = "up", "down", "enter", "esc", "backspace"
+LEFT, RIGHT, UP, DOWN, ENTER, ESC, BACKSPACE = "left", "right", "up", "down", "enter", "esc", "backspace"
 CTRL_R = "\x12"  # Ctrl+R = tampilkan/sembunyikan panel riwayat
 
 
@@ -35,7 +36,7 @@ def read_key() -> str:
         ch = msvcrt.getwch()
         if ch in ("\x00", "\xe0"):  # tombol khusus (panah, F1..)
             ch2 = msvcrt.getwch()
-            return {"H": UP, "P": DOWN}.get(ch2, "")
+            return {"H": UP, "P": DOWN, "K": LEFT, "M": RIGHT}.get(ch2, "")
         return {"\r": ENTER, "\x1b": ESC, "\x08": BACKSPACE}.get(ch, ch)
     import termios
     import tty
@@ -47,7 +48,7 @@ def read_key() -> str:
         ch = sys.stdin.read(1)
         if ch == "\x1b":
             seq = ch + sys.stdin.read(2)
-            return {"\x1b[A": UP, "\x1b[B": DOWN, "\x1b\x1b\x1b": ESC}.get(seq, ESC)
+            return {"\x1b[A": UP, "\x1b[B": DOWN, "\x1b[C": RIGHT, "\x1b[D": LEFT, "\x1b\x1b\x1b": ESC}.get(seq, ESC)
         return {"\r": ENTER, "\n": ENTER, "\x7f": BACKSPACE}.get(ch, ch)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
@@ -137,8 +138,12 @@ def render(st: State) -> str:
         flags = " ⏸ JEDA" if st.paused else ""
         out.append(f"♫ Memutar:{flags} {st.playing}")
         if st.volume is not None:
-            out.append(f"Volume: {volume_bar(st.volume)}   ( - / + )")
-        out.append("(spasi=jeda | -/+=volume | tombol lain=berhenti)")
+            out.append(f"Volume: {volume_bar(st.volume)}   ( - / + | ←/→ seek )")
+            out.append("(spasi=jeda | -/+=volume | ←/→=seek 5 dtk | q=berhenti)")
+        elif st.mpv_msg:
+            out.append("(spasi=jeda | q=berhenti — volume/seek gagal, putar ulang)")
+        else:
+            out.append("(spasi=jeda | q=berhenti — volume/seek butuh mpv)")
     elif st.show_history:
         out.append(f"Riwayat terakhir ({len(st.history)}) — ↑↓ pilih, Enter putar:")
         for i, h in enumerate(st.history[st.scroll : st.scroll + rows], start=st.scroll):
@@ -203,16 +208,21 @@ def do_search(st: State) -> None:
         else f"Tidak ada hasil untuk '{st.query}'."
     )
 
-
 def playing_action(key: str) -> str:
-    """Aksi tombol saat memutar: 'pause' | 'voldn' | 'volup' | 'stop'."""
+    """Aksi tombol saat memutar: 'pause' | 'voldn' | 'volup' | 'seekback' | 'seekfwd' | 'stop' | ''."""
     if key == " ":
         return "pause"
     if key == "-":
         return "voldn"
     if key in ("+", "="):
         return "volup"
-    return "stop"
+    if key == LEFT:
+        return "seekback"
+    if key == RIGHT:
+        return "seekfwd"
+    if key in ("q", "Q", ESC, "\x03"):
+        return "stop"
+    return ""
 
 
 def _wait_key() -> str:
@@ -220,7 +230,7 @@ def _wait_key() -> str:
     if _WINDOWS:
         while not msvcrt.kbhit():
             time.sleep(0.05)
-        return msvcrt.getwch()
+        return read_key()
     import select
 
     while not select.select([sys.stdin], [], [], 0.2)[0]:
@@ -254,6 +264,20 @@ def _change_volume(st: State, ipc, delta: int) -> None:
         st.volume = int(ipc.get_property("volume"))
     except Exception as e:
         st.status = f"Volume gagal: {e}"
+
+
+def _seek(st: State, ipc, delta: int) -> None:
+    # Seek = perintah mpv via IPC; ffplay tak punya remote control.
+    if ipc is None:
+        if st.mpv_msg:
+            st.status = f"Seek gagal: {st.mpv_msg} — putar ulang."
+        else:
+            st.status = "Seek butuh mpv — install mpv (https://mpv.io), lalu putar ulang."
+        return
+    try:
+        ipc.command("seek", delta)
+    except Exception as e:
+        st.status = f"Seek gagal: {e}"
 
 
 def do_play(st: State) -> None:
@@ -302,8 +326,14 @@ def do_play(st: State) -> None:
                 _change_volume(st, ipc, -5)
             elif action == "volup":
                 _change_volume(st, ipc, +5)
-            else:
+            elif action == "seekback":
+                _seek(st, ipc, -5)
+            elif action == "seekfwd":
+                _seek(st, ipc, 5)
+            elif action == "stop":
                 break
+            else:
+                continue  # tombol tak dikenal: abaikan, jangan hentikan lagu
             print(f"\x1b[2J\x1b[H{render(st)}", end="", flush=True)
     finally:
         stop_player(proc)

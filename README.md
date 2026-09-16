@@ -43,7 +43,8 @@ Format hasil: `[n] Judul — Artis (durasi) [videoId]`
 | Search | `Ctrl+R` | panel riwayat: `↑` `↓` pilih, `Enter` putar, `Esc` tutup |
 | Playing | `Space` | pause / resume |
 | Playing | `+` / `-` | volume up / down (mpv saja) |
-| Playing | `q` / `Esc` | stop, kembali ke hasil |
+| Playing | `←` / `→` | seek -5 / +5 detik (mpv saja) |
+| Playing | `q` / `Esc` | stop, kembali ke hasil (tombol lain diabaikan) |
 
 ## Struktur
 

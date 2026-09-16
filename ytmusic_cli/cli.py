@@ -3,6 +3,7 @@ import sys
 
 from .models import format_track
 from .player import play_with_metadata
+from .search import search_tracks
 
 
 def build_parser() -> argparse.ArgumentParser:
