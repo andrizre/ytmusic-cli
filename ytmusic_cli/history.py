@@ -30,6 +30,15 @@ class HistoryEntry:
     played_at: float = 0.0
 
 
+def _cache_dir() -> Path:
+    """Direktori cache ytmusic-cli per platform."""
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")
+        return Path(base) / "ytmusic-cli"
+    xdg = os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")
+    return Path(xdg) / "ytmusic-cli"
+
+
 def history_file(path: str | Path | None = None) -> Path:
     """Lokasi file cache riwayat. Argumen path menimpa default (untuk tes)."""
     if path is not None:
@@ -37,11 +46,7 @@ def history_file(path: str | Path | None = None) -> Path:
     override = os.environ.get("YTMUSIC_CLI_HISTORY_FILE")
     if override:
         return Path(override).expanduser()
-    if os.name == "nt":
-        base = os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")
-        return Path(base) / "ytmusic-cli" / "history.json"
-    xdg = os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")
-    return Path(xdg) / "ytmusic-cli" / "history.json"
+    return _cache_dir() / "history.json"
 
 
 def entry_from_dict(d: dict) -> HistoryEntry | None:
@@ -163,3 +168,60 @@ def format_history_entry(i: int, e: HistoryEntry) -> str:
         f"[{i}] {e.title} — {e.artists} ({e.duration or '?'}) "
         f"[{e.video_id}] • {format_played_at(e.played_at)}"
     )
+
+
+def queue_file(path: str | Path | None = None) -> Path:
+    """Lokasi file antrean tersimpan. Env YTMUSIC_CLI_QUEUE_FILE menimpa default."""
+    if path is not None:
+        return Path(path).expanduser()
+    override = os.environ.get("YTMUSIC_CLI_QUEUE_FILE")
+    if override:
+        return Path(override).expanduser()
+    return _cache_dir() / "queue.json"
+
+
+def _queue_track_from_dict(d: dict) -> Track | None:
+    """Parse satu dict antrean; None bila video_id hilang/rusak (toleran)."""
+    try:
+        vid = str(d.get("video_id") or "")
+        if not vid:
+            return None
+        return Track(
+            video_id=vid,
+            title=str(d.get("title") or vid),
+            artists=str(d.get("artists") or "Unknown"),
+            duration=d.get("duration"),
+            album=d.get("album"),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def load_queue(path: str | Path | None = None) -> list[Track]:
+    """Baca antrean tersimpan; file hilang/rusak → []."""
+    try:
+        raw = json.loads(queue_file(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    return [
+        t
+        for d in raw
+        if isinstance(d, dict)
+        for t in [_queue_track_from_dict(d)]
+        if t is not None
+    ]
+
+
+def save_queue(queue: list[Track], path: str | Path | None = None) -> Path:
+    """Tulis antrean atomis (tmp + replace). Kembalikan path file."""
+    f = queue_file(path)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    tmp = f.with_suffix(".tmp")
+    tmp.write_text(
+        json.dumps([asdict(e) for e in queue], ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(tmp, f)
+    return f

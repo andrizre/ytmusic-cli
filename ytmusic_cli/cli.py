@@ -14,14 +14,16 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("query", help="Kata kunci pencarian")
     ps.add_argument("-n", "--limit", type=int, default=10, help="Jumlah hasil (default 10)")
 
-    pp = sub.add_parser("play", help="Putar audio dari videoId atau URL")
-    pp.add_argument("input", help="videoId (11 char) atau URL music.youtube.com/youtube.com/watchyoutu.be/")
+    pp = sub.add_parser("play", help="Putar audio dari videoId, URL, atau kata kunci")
+    pp.add_argument("input", help="videoId (11 char), URL music.youtube.com/youtube.com/watch/youtu.be/, atau kata kunci")
+    pp.add_argument("--first", action="store_true", help="Bila query: langsung putar hasil pertama tanpa konfirmasi")
     ph = sub.add_parser("history", help="Lihat riwayat putar (cache 30 hari / 30 lagu)")
     ph.add_argument("-n", "--limit", type=int, default=30, help="Jumlah entri (default 30)")
     ph.add_argument("--clear", action="store_true", help="Hapus riwayat")
     ph.add_argument("--json", action="store_true", help="Output JSON")
 
     sub.add_parser("tui", help="Mode interaktif (ketik query, pilih, putar)")
+    sub.add_parser("doctor", help="Cek mpv/ffplay, library, lokasi riwayat")
     return p
 
 
@@ -72,13 +74,44 @@ def main(argv: list[str] | None = None) -> int:
         if not shown:
             print("Belum ada riwayat.")
             return 0
-        for i, e in enumerate(shown, start=1):
-            print(format_history_entry(i, e))
+        for i, ent in enumerate(shown, start=1):
+            print(format_history_entry(i, ent))
         return 0
+    if args.command == "doctor":
+        from .doctor import main as _doctor
+
+        return _doctor()
     if args.command == "play":
-        print(f"Memutar {args.input} ... (Ctrl-C untuk berhenti)", file=sys.stderr)
+        from .player import is_direct_input
+
+        target = args.input
+        if not is_direct_input(target):
+            try:
+                tracks = search_tracks(target, limit=5 if not args.first else 1)
+            except Exception as e:
+                print(f"Search gagal: {e}", file=sys.stderr)
+                return 1
+            if not tracks:
+                print(f"Tidak ada hasil untuk '{target}'")
+                return 1
+            if args.first:
+                target = tracks[0].video_id
+            else:
+                for i, t in enumerate(tracks, start=1):
+                    print(format_track(i, t))
+                try:
+                    pick = input("Pilih [1]: ").strip() or "1"
+                except (EOFError, KeyboardInterrupt):
+                    print(file=sys.stderr)
+                    return 130
+                try:
+                    target = tracks[int(pick) - 1].video_id
+                except (ValueError, IndexError):
+                    print(f"Pilihan '{pick}' tidak valid.", file=sys.stderr)
+                    return 1
+        print(f"Memutar {target} ... (Ctrl-C untuk berhenti)", file=sys.stderr)
         try:
-            rc, track = play_with_metadata(args.input)
+            rc, track = play_with_metadata(target)
         except Exception as e:
             print(f"Gagal memutar: {e}", file=sys.stderr)
             return 1

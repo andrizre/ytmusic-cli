@@ -51,10 +51,29 @@ def _cache_key(video_id_or_url: str, url: str) -> str:
     return normalize_video_id(video_id_or_url, url)
 
 
+def is_direct_input(s: str) -> bool:
+    """True bila s langsung bisa diputar: videoId 11 char atau URL (ada skema). Selain itu = kata kunci search."""
+    s = (s or "").strip()
+    return bool(s) and (_is_video_id(s) or "://" in s)
+
+
 def _watch_url(video_id_or_url: str) -> str:
     if _is_video_id(video_id_or_url):
         return f"https://music.youtube.com/watch?v={video_id_or_url}"
     return video_id_or_url
+
+
+def prefetch_stream(video_id_or_url: str) -> None:
+    """Hangatkan _STREAM_CACHE untuk lagu berikutnya di thread daemon. Gagal = diam (resolve nanti yang retry)."""
+    import threading
+
+    def _one() -> None:
+        try:
+            resolve_stream_url(video_id_or_url)
+        except Exception:
+            pass
+
+    threading.Thread(target=_one, daemon=True).start()
 
 
 def format_duration(seconds: float | int | None) -> str | None:
@@ -133,11 +152,20 @@ def _ydl_opts() -> dict:
     }
 
 
-def fetch_info(video_id_or_url: str) -> dict:
-    """Ambil info dict yt-dlp sekali (dipakai untuk stream URL + metadata)."""
+def fetch_info(video_id_or_url: str, tries: int = 3) -> dict:
+    """Ambil info dict yt-dlp sekali (dipakai untuk stream URL + metadata). Retry backoff bila network hiccup."""
     url = _watch_url(video_id_or_url)
-    with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
-        return ydl.extract_info(url, download=False)
+    last: Exception | None = None
+    for attempt in range(max(tries, 1)):
+        try:
+            with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
+                return ydl.extract_info(url, download=False)
+        except Exception as e:
+            last = e
+            if attempt + 1 >= max(tries, 1):
+                raise
+            time.sleep(1.0 * (2**attempt))
+    raise last or RuntimeError("fetch info gagal")
 
 
 def stream_url_from_info(info: dict, key: str) -> str:
@@ -252,7 +280,7 @@ def _attach_kill_on_parent_exit(proc: subprocess.Popen) -> None:
         import ctypes
         from ctypes import wintypes
 
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
 
         class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
             _fields_ = [
@@ -289,7 +317,7 @@ def _attach_kill_on_parent_exit(proc: subprocess.Popen) -> None:
         if ok and handle:
             ok = kernel32.AssignProcessToJobObject(h_job, handle)
         if ok:
-            proc._ytmusic_job = h_job  # noqa: SLF001 — jaga handle tetap terbuka
+            setattr(proc, "_ytmusic_job", h_job)  # jaga handle tetap terbuka
             h_job = None  # kepemilikan pindah ke proc; jangan ditutup di finally
     except Exception:
         pass
@@ -298,7 +326,7 @@ def _attach_kill_on_parent_exit(proc: subprocess.Popen) -> None:
             try:
                 import ctypes
 
-                ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(h_job)
+                ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(h_job)  # type: ignore[attr-defined]
             except Exception:
                 pass
 
@@ -318,12 +346,12 @@ def stop_player(proc: subprocess.Popen, timeout: float = 5) -> None:
             try:
                 import ctypes
 
-                ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(h_job)
+                ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(h_job)  # type: ignore[attr-defined]
             except Exception:
                 pass
             finally:
                 try:
-                    del proc._ytmusic_job  # noqa: SLF001
+                    delattr(proc, "_ytmusic_job")
                 except AttributeError:
                     pass
 
@@ -348,7 +376,7 @@ def _for_each_thread(pid: int, action) -> bool:
     import ctypes
     from ctypes import wintypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
 
     class THREADENTRY32(ctypes.Structure):
         _fields_ = [
@@ -389,7 +417,7 @@ def suspend_process(proc: subprocess.Popen) -> bool:
     if os.name == "posix":
         import signal
 
-        proc.send_signal(signal.SIGSTOP)
+        proc.send_signal(signal.SIGSTOP)  # type: ignore[attr-defined]
         return True
     return _for_each_thread(proc.pid, lambda k, h: k.SuspendThread(h))
 
@@ -406,7 +434,7 @@ def resume_process(proc: subprocess.Popen) -> bool:
     if os.name == "posix":
         import signal
 
-        proc.send_signal(signal.SIGCONT)
+        proc.send_signal(signal.SIGCONT)  # type: ignore[attr-defined]
         return True
     return _for_each_thread(proc.pid, _resume_one)
 
@@ -429,7 +457,7 @@ class MpvIpc:
             try:
                 if path.startswith("\\\\.\\pipe\\"):
                     return cls(open(path, "r+b", buffering=0))
-                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)  # type: ignore[attr-defined]
                 try:
                     s.connect(path)
                 except Exception:
