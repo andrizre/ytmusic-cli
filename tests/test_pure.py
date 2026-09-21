@@ -55,9 +55,14 @@ from ytmusic_cli.tui import (
     UP,
     State,
     _current_track,
+    _fit,
+    _row,
+    _spinner,
+    _truncate,
     build_queue,
     clamp_scroll,
     cycle_repeat,
+    disp_width,
     do_history,
     do_history_clear,
     do_history_delete,
@@ -68,6 +73,7 @@ from ytmusic_cli.tui import (
     do_queue_move,
     do_queue_save,
     handle_key,
+    paint,
     playing_action,
     progress_bar,
     render,
@@ -645,11 +651,146 @@ class HistoryModeTest(unittest.TestCase):
         self.assertEqual(t.video_id, "vid00000001")
 
     def test_render_mode_riwayat_tandai_pilihan(self):
-        st = State()
-        do_history(st)
+        # render() memakai _row() yang butuh warna aktif untuk highlight;
+        # NO_COLOR di env luar (CI) menonaktifkannya → cek via proses anak.
+        import subprocess
+
+        code = (
+            "import os; os.environ['FORCE_COLOR']='1'; os.environ.pop('NO_COLOR',None);"
+            "from ytmusic_cli.tui import State, render, do_history;"
+            "st=State(); do_history(st); out=render(st);"
+            "import sys; sys.exit(0 if '\\x1b[48;5;62m' in out else 1)"
+        )
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+
+
+class RenderLayoutTest(unittest.TestCase):
+    """Tes layout render baru: lebar adaptif, kolom rapi, NO_COLOR aman."""
+
+    def test_render_kosong_tak_gagal(self):
+        out = render(State())
+        self.assertIn("Cari", out)
+        self.assertIn("Belum ada hasil", out)
+
+    def test_render_hasil_punya_nomor_dan_terpilih(self):
+        st = State(results=[_track(1), _track(2)], selected=1)
         out = render(st)
-        self.assertIn("Riwayat terakhir (2)", out)
-        self.assertIn("\x1b[7m", out)
+        self.assertIn("Judul 1", out)
+        self.assertIn("vid00000001", out)
+        self.assertNotIn("\x1b[7m", out)  # highlight baru pakai 48;5;
+        self.assertIn("\x1b[48;5;62m", out)
+
+    def test_render_playing_berisi_judul_dan_queue(self):
+        st = State(
+            playing="Judul 1 — Artis",
+            queue=[_track(1), _track(2)],
+            queue_pos=0,
+            position=30.0,
+            duration=180.0,
+        )
+        out = render(st)
+        self.assertIn("Judul 1", out)
+        self.assertIn("0:30 / 3:00", out)
+        self.assertIn("[1/2]", out)
+
+    def test_render_paused_pakai_tanda_jeda(self):
+        st = State(playing="Judul 1 — Artis", paused=True)
+        out = render(st)
+        self.assertIn("⏸", out)
+
+    def test_render_shuffle_repeat_tampil_sebagai_tag(self):
+        st = State(playing="T", shuffle=True, repeat="one")
+        out = render(st)
+        self.assertIn("acak", out)
+        self.assertIn("ulangi-1", out)
+
+    def test_loading_menampilkan_spinner_dan_menghilang(self):
+        st = State(loading=True)
+        self.assertIn(_spinner(), render(st))
+        st.loading = False
+        self.assertNotIn(_spinner(), render(st))
+
+    def test_status_error_diwarnai_gagal(self):
+        st = State(status="Gagal memutar: boa")
+        self.assertIn("Gagal", render(st))
+
+    def test_render_terminal_sempit_tak_panic(self):
+        import ytmusic_cli.tui as tui
+
+        old = tui._term_size
+        tui._term_size = lambda: (30, 12)
+        try:
+            out = render(State(results=[_track(i) for i in range(20)], selected=5))
+            for line in out.splitlines():
+                self.assertLessEqual(disp_width(line), 40)
+        finally:
+            tui._term_size = old
+
+
+class DispWidthTest(unittest.TestCase):
+    def test_ascii_satu_per_char(self):
+        self.assertEqual(disp_width("abc"), 3)
+
+    def test_cjk_lebar_dua(self):
+        self.assertEqual(disp_width("夜に"), 4)
+
+    def test_emoji_lebar_dua(self):
+        self.assertGreaterEqual(disp_width("🎵"), 1)
+
+    def test_combining_nol(self):
+        self.assertEqual(disp_width("a\u0301"), 1)
+
+    def test_truncate_dengan_elipsis(self):
+        self.assertEqual(_truncate("abcdefg", 4), "abc…")
+        self.assertEqual(_truncate("abcde", 5), "abcde")
+        self.assertEqual(_truncate("abc", 10), "abc")
+        self.assertEqual(_truncate("abc", 0), "")
+
+    def test_truffle_lebar_cjk(self):
+        self.assertEqual(_truncate("夜に来る", 5), "夜に…")
+
+    def test_fit_padding_pas_lebar(self):
+        self.assertEqual(_fit("ab", 5), "ab   ")
+        self.assertEqual(disp_width(_fit("abcdef", 3)), 3)
+
+
+class ColorTest(unittest.TestCase):
+    def test_no_color_menonaktifkan_escape(self):
+        old = os.environ.get("NO_COLOR")
+        os.environ["NO_COLOR"] = "1"
+        try:
+            self.assertEqual(paint("x", 51), "x")
+        finally:
+            if old is None:
+                os.environ.pop("NO_COLOR", None)
+            else:
+                os.environ["NO_COLOR"] = old
+
+    def test_force_color_mengaktifkan_escape(self):
+        # Set env di proses anak: _color() ditakwil saat impor modul, sehingga
+        # NO_COLOR/ForceColor dari luar (mis. CI) tak bisa diubah di tengah jalan.
+        import subprocess
+
+        code = (
+            "import os; os.environ['FORCE_COLOR']='1'; os.environ.pop('NO_COLOR',None);"
+            "from ytmusic_cli.tui import paint;"
+            "import sys; sys.exit(0 if '\\x1b[' in paint('x', 51) else 1)"
+        )
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+
+    def test_paint_tanpa_kode_polos(self):
+        self.assertEqual(paint("x"), "x")
+
+    def test_row_terpilih_latar_penuh(self):
+        line = _row([("a", 3, 0)], 10, True)
+        self.assertTrue(line.startswith("\x1b[48;5;"))
+        self.assertTrue(disp_width(line) >= 10)
+
+    def test_row_biasa_tanpa_latar(self):
+        line = _row([("a", 3, 0)], 10, False)
+        self.assertNotIn("\x1b[48", line)
 
 
 class ProgressBarTest(unittest.TestCase):

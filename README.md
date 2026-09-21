@@ -86,6 +86,23 @@ Volume yang dipilih di TUI disimpan di `settings.json` di direktori yang sama
 (env `YTMUSIC_CLI_SETTINGS_FILE` menimpa); nilai dipakai lagi di trek berikutnya
 dan di sesi berikutnya.
 
+## Tampilan
+
+TUI memakai warna ANSI 256 dengan layout yang menyesuaikan lebar terminal:
+
+- Baris terpilih disorot penuh (blok biru-kelabu), bukan sekadar reverse-video.
+- Judul lagu cyan, artis abu hangat, durasi/videoId redup — hierarki jelas.
+- Panel riwayat & antrean memiliki judul dengan hint kanan (titik-titik pengisi).
+- Label `▶`/`⏸`, tag `[acak]` `[ulangi-1]` `[i/N]`, bar progres + bar volume
+  sejajar dalam satu baris.
+- Judul terminal ikut berisi lagu yang sedang diputar (reset saat keluar).
+- Penyangga ganda (double buffering): layar hanya ditulis ulang bila isinya
+  berubah → tak ada kedipan saat polling progres tiap detik.
+- Lebar terminal sempit (mis. 40 kolom) otomatis memotong teks panjang
+  dengan elipsis, termasuk teks CJK yang dihitung lebar 2 kolom.
+- `NO_COLOR=1` (atau output bukan tty) menonaktifkan semua escape sequence;
+  `FORCE_COLOR=1` memaksanya untuk pipa/CI.
+
 ## Roadmap (WIP)
 
 - [ ] Stabilkan playback mpv vs ffplay

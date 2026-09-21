@@ -20,12 +20,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from .models import Track, format_track
+from .models import Track
 from .history import (
     HistoryEntry,
     add_history,
     clear_history,
-    format_history_entry,
+    format_played_at,
     load_history,
     load_queue,
     load_settings,
@@ -49,6 +49,114 @@ CTRL_Q = "\x11"  # Ctrl+Q = panel antrean
 CTRL_A = "\x01"  # Ctrl+A = tambah lagu terpilih ke antrean
 
 RepeatMode = Literal["off", "all", "one"]  # ulangi: mati | semua lagu | lagu ini
+
+# ── Tampilan ────────────────────────────────────────────────────────────────
+# Warna ANSI 256. paint() menjadi polos (tanpa escape) bila NO_COLOR / bukan tty,
+# jadi output `ytmusic tui | cat` maupun CI tetap bersih.
+C_TITLE = 51  # cyan terang — judul lagu
+C_ARTIST = 245  # abu hangat — artis / metadata
+C_DIM = 240  # abu gelap — pemisah, nomor, durasi
+C_ACCENT = 213  # magenta — penanda ▶ / aksen
+C_OK = 35  # hijau — status positif, tag aktif
+C_WARN = 214  # jingga — jeda, peringatan
+C_ERR = 196  # merah — error
+C_SEL_BG = 62  # biru-kelabu — latar baris terpilih
+C_SEL_FG = 15  # putih — teks baris terpilih
+
+_SPINNER = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+_WIDE = {"W", "F"}  # East Asian Wide / Fullwidth → lebar 2 kolom
+
+
+def _color() -> bool:
+    """True bila output layar mendukung warna (hormati NO_COLOR / FORCE_COLOR)."""
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    try:
+        return bool(sys.stdout.isatty())
+    except Exception:
+        return False
+
+
+def paint(text: str, *codes: int) -> str:
+    """Bungkus teks dengan kode SGR; transparan bila warna dimatikan."""
+    if not codes or not _color():
+        return text
+    return f"\x1b[{';'.join(str(c) for c in codes)}m{text}\x1b[0m"
+
+
+def _fg(text: str, code: int, inside_bg: bool = False) -> str:
+    """Warnai foreground saja. inside_bg=True → reset hanya fg (pertahankan latar)."""
+    if not code or not _color():
+        return text
+    reset = "\x1b[39m" if inside_bg else "\x1b[0m"
+    return f"\x1b[38;5;{code}m{text}{reset}"
+
+
+def disp_width(s: str) -> int:
+    """Lebar tampilan perkiraan: wide CJK/emoji = 2, combining = 0."""
+    import unicodedata
+
+    return sum(
+        0
+        if unicodedata.combining(ch)
+        else (2 if unicodedata.east_asian_width(ch) in _WIDE else 1)
+        for ch in s
+    )
+
+
+def _truncate(s: str, width: int) -> str:
+    """Potong teks ke `width` kolom, elipsis termasuk dalam anggaran."""
+    if width <= 0:
+        return ""
+    if disp_width(s) <= width:
+        return s
+    import unicodedata
+
+    out: list[str] = []
+    n = 0
+    for ch in s:
+        if unicodedata.combining(ch):
+            continue
+        w = 2 if unicodedata.east_asian_width(ch) in _WIDE else 1
+        if n + w + 1 > width:  # sisakan 1 kolom untuk elipsis
+            break
+        out.append(ch)
+        n += w
+    return "".join(out) + "…"
+
+
+def _fit(s: str, width: int) -> str:
+    """Potong + padding spasi ke lebar tampilan persis `width`."""
+    s = _truncate(s, max(width, 0))
+    return s + " " * max(width - disp_width(s), 0)
+
+
+def _row(segs: list[tuple[str, int, int]], width: int, selected: bool) -> str:
+    """Rakit satu baris daftar selebar `width` (lihat _segment_width)."""
+    parts: list[str] = []
+    for text, w, fg in segs:
+        t = _fit(text, w)
+        parts.append(_fg(t, fg, inside_bg=selected) if fg else t)
+    return _fill("".join(parts), width, selected)
+
+
+def _segment_width(segs: list[tuple[str, int, int]]) -> int:
+    """Lebar total per-desain segmen (semua lebar kolom tuntas, tanpa sisa)."""
+    return sum(w for _, w, _ in segs)
+
+
+def _fill(body: str, width: int, selected: bool) -> str:
+    """Rata-kanan ke `width` dengan latar baris terpilih."""
+    pad = max(width - disp_width(body), 0)
+    if selected:
+        return f"\x1b[48;5;{C_SEL_BG}m\x1b[38;5;{C_SEL_FG}m{body}{' ' * pad}\x1b[0m"
+    return body + " " * pad
+
+
+def _spinner() -> str:
+    return _SPINNER[int(time.time() * 4) % len(_SPINNER)]
 
 
 def read_key() -> str:
@@ -98,6 +206,9 @@ class State:
     settings_path: str | None = None  # lokasi settings.json (diisi run_tui; None = default)
     position: float | None = None  # detik berjalan (mpv time-pos)
     duration: float | None = None  # durasi detik (mpv duration)
+    loading: bool = False  # True saat search/resolve berjalan → tampilkan spinner
+    last_frame: str = ""  # frame render sebelumnya (anti-kedip: skip bila sama)
+    term_title: str = ""  # judul terminal (tracking agar tak ditulis berulang)
 
 
 def handle_key(st: State, key: str) -> str:
@@ -237,8 +348,24 @@ def step_queue(pos: int, length: int, nav: str | None, shuffle: bool, repeat: Re
     return 0 if repeat == "all" else None
 
 
+def _term_size() -> tuple[int, int]:
+    """(lebar, tinggi) terminal; fallback 80x24 bila tak terbaca."""
+    try:
+        w, h = shutil.get_terminal_size()
+        return max(int(w), 20), max(int(h), 10)
+    except Exception:
+        return 80, 24
+
+
 def _list_rows() -> int:
-    return min(shutil.get_terminal_size().lines - 4, 20)
+    _, h = _term_size()
+    # ruang untuk: header 1 + pemisah 1 + now-playing 4 + pemisah 1 + footer 3
+    return max(min(h - 10, 20), 3)
+
+
+def _list_width() -> int:
+    w, _ = _term_size()
+    return max(w - 2, 20)  # margin 1 kolom di kiri/kanan
 
 
 def clamp_scroll(st: State) -> None:
@@ -250,53 +377,151 @@ def clamp_scroll(st: State) -> None:
         st.scroll = st.selected - rows + 1
 
 
+def _playing_rows(st: State, width: int) -> list[str]:
+    """Blok 'Sedang Memutar' dua baris + tag + hint baris, selebar `width`."""
+    # baris 1: ▶ judul (cyan) + ⏸ bila jeda + [i/N]
+    mark = paint("⏸", C_WARN) if st.paused else paint("▶", C_ACCENT)
+    tags = []
+    if st.shuffle:
+        tags.append("acak")
+    if st.repeat == "all":
+        tags.append("ulangi-semua")
+    elif st.repeat == "one":
+        tags.append("ulangi-1")
+    tag = paint("[" + "+".join(tags) + "]", C_OK) if tags else ""
+    qinfo = ""
+    if st.queue:
+        cur = min(st.queue_pos, len(st.queue) - 1) if st.queue_pos >= 0 else 0
+        qinfo = paint(f"[{cur + 1}/{len(st.queue)}]", C_ARTIST)
+    title = st.playing or ""
+    # ruang untuk mark + qinfo + tag (+ pemisahnya)
+    used = 2 + (len(qinfo) + 1 if qinfo else 0) + (disp_width(tag) + 1 if tag else 0)
+    title_w = max(width - used, 8)
+    line = f"{mark} {_fg(_truncate(title, title_w), C_TITLE)}"
+    if qinfo:
+        line += f" {qinfo}"
+    if tag:
+        line += f" {tag}"
+    out = [line]
+
+    # baris 2: bar progres (atau posisi statis) + volume
+    bar = progress_bar(st.position, st.duration)
+    vol = ""
+    if st.volume_control:
+        vol = paint(f"♪ {volume_bar(st.volume)}", C_ARTIST)
+    if bar and vol:
+        gap = max(width - (disp_width(bar) + 1 + disp_width(vol)), 1)
+        out.append(f"{bar}{' ' * gap}{vol}")
+    elif bar:
+        out.append(bar)
+    elif vol:
+        out.append(" " + vol)
+    return out
+
+
+def _list_title(title: str, count: int, width: int, hint: str) -> str:
+    """Judul panel + jumlah + hint kanan, dipotong rapi selebar `width`."""
+    left = f"{title} ({count})"
+    right = f"{hint}"
+    rw = disp_width(right)
+    if rw + 2 < width:
+        gap = width - disp_width(left) - rw
+        if gap >= 2:
+            return f"{paint(left, C_TITLE)} {paint('·' * (gap - 2), C_DIM)} {paint(right, C_DIM)}"
+    return paint(_truncate(left, width), C_TITLE)
+
+
 def render(st: State) -> str:
+    width = _list_width()
     rows = _list_rows()
-    out = [f"> Cari: {st.query}█", "─" * 40]
+    out: list[str] = []
+
+    # ── Header: search bar ──
+    prompt = paint("Cari", C_DIM)
+    q = _truncate(st.query, max(width - disp_width(prompt) - 4, 4))
+    out.append(f"{prompt} › {paint(q, C_TITLE)}{paint('█', C_ACCENT)}")
+
+    # ── Body: now-playing di atas, lalu daftar ──
     if st.playing:
-        flags = " ⏸ JEDA" if st.paused else ""
-        qinfo = f" [{st.queue_pos + 1}/{len(st.queue)}]" if st.queue else ""
-        tags = []
-        if st.shuffle:
-            tags.append("acak")
-        if st.repeat == "all":
-            tags.append("ulangi-semua")
-        elif st.repeat == "one":
-            tags.append("ulangi-1")
-        tag = f" [{'+'.join(tags)}]" if tags else ""
-        out.append(f"♫ Memutar:{flags}{qinfo}{tag} {st.playing}")
-        bar = progress_bar(st.position, st.duration)
-        if bar:
-            out.append(bar)
-        if st.volume_control:
-            out.append(f"Volume: {volume_bar(st.volume)}   ( - / + | ←/→ seek )")
-            out.append("(spasi=jeda | n/p=next/prev | s=acak | r=ulangi | x=hapus | -/+=volume | ←/→=seek 5 dtk | q=berhenti)")
-        elif st.mpv_msg:
-            out.append("(spasi=jeda | n/p=next/prev | s=acak | r=ulangi | x=hapus | q=berhenti — volume/seek gagal, putar ulang)")
-        else:
-            out.append("(spasi=jeda | n/p=next/prev | s=acak | r=ulangi | x=hapus | q=berhenti — volume/seek butuh mpv)")
-    elif st.show_queue:
+        out.append("")
+        out.extend(_playing_rows(st, width))
+        out.append("")
+        hint1 = "spasi=jeda · n/p=next/prev · s=acak · r=ulangi · x=hapus · q=berhenti"
+        hint2 = (
+            "-/+=volume · ←→=seek 5 dtk"
+            if st.volume_control
+            else ("volume/seek gagal — putar ulang" if st.mpv_msg else "volume/seek butuh mpv")
+        )
+        out.append(paint("  " + _truncate(hint1, max(width - 2, 4)), C_DIM))
+        out.append(paint("  " + _truncate(hint2, max(width - 2, 4)), C_DIM))
+    if st.loading:
+        out.append(paint(f"  {_spinner()} memuat…", C_ACCENT))
+    out.append(paint("─" * width, C_DIM))
+
+    def _render_list(items, fmt, sel_idx: int) -> None:
+        for i, item in enumerate(items[st.scroll : st.scroll + rows], start=st.scroll):
+            segs = fmt(i + 1, item, width)
+            out.append(_row(segs, _segment_width(segs), i == sel_idx))
+
+    if st.show_queue:
         if st.queue:
-            out.append(f"Antrean ({len(st.queue)}) — ↑↓ pilih, Enter putar, x hapus, u/d susun, S simpan, L muat:")
-            for i, t in enumerate(st.queue[st.scroll : st.scroll + rows], start=st.scroll):
-                line = format_track(i + 1, t)
-                out.append(f"\x1b[7m{line}\x1b[0m" if i == st.selected else line)
+            out.append(
+                _list_title("Antrean", len(st.queue), width, "Enter putar · x hapus · u/d susun · S simpan · L muat")
+            )
+            _render_list(st.queue, _queue_segments, st.selected)
         else:
-            out.append("(antrean kosong — Ctrl+A tambah dari hasil, L muat simpanan)")
+            out.append(paint("Antrean kosong — Ctrl+A tambah dari hasil, L muat simpanan.", C_DIM))
     elif st.show_history:
-        out.append(f"Riwayat terakhir ({len(st.history)}) — ↑↓ pilih, Enter putar, x hapus, C bersihkan:")
-        for i, h in enumerate(st.history[st.scroll : st.scroll + rows], start=st.scroll):
-            line = format_history_entry(i + 1, h)
-            out.append(f"\x1b[7m{line}\x1b[0m" if i == st.selected else line)
-    elif not st.results:
-        out.append("(belum ada hasil — Ctrl+R untuk riwayat)")
+        out.append(_list_title("Riwayat", len(st.history), width, "Enter putar · x hapus · C bersihkan"))
+        if st.history:
+            _render_list(st.history, _history_segments, st.selected)
+    elif st.results:
+        _render_list(st.results, _result_segments, st.selected)
     else:
-        for i, t in enumerate(st.results[st.scroll : st.scroll + rows], start=st.scroll):
-            line = format_track(i + 1, t)
-            out.append(f"\x1b[7m{line}\x1b[0m" if i == st.selected else line)
-    out.append("─" * 40)
-    out.append(f"{st.status}  [↑↓ pilih | Enter cari/putar | Ctrl+R riwayat | Ctrl+Q antrean | Esc keluar]")
+        out.append(paint("Belum ada hasil — ketik lagu/artis + Enter, atau Ctrl+R untuk riwayat.", C_DIM))
+
+    # ── Footer: status + tombol ──
+    out.append(paint("─" * width, C_DIM))
+    status = st.status or ""
+    scode = C_ERR if status.startswith(("Gagal", "Riwayat gagal")) else (C_OK if status else C_DIM)
+    status_line = _truncate(status, max(width - 2, 4))
+    out.append(f"{_fg(status_line, scode)}")
+    footer1 = "↑↓ pilih · Enter cari/putar · Esc keluar"
+    footer2 = "Ctrl+R riwayat · Ctrl+Q antrean · Ctrl+A tambah"
+    out.append(paint("  " + _truncate(footer1, max(width - 2, 4)), C_DIM))
+    out.append(paint("  " + _truncate(footer2, max(width - 2, 4)), C_DIM))
     return "\n".join(out)
+
+
+def _result_segments(i: int, t: Track, width: int) -> list[tuple[str, int, int]]:
+    """Kolom baris hasil search: nomor, judul+artis, durasi, videoId (teks polos)."""
+    spare = width - (3 + 1 + 5 + 1 + 11)
+    return [
+        (f"{i:>2}", 3, C_DIM),
+        (f"{t.title} — {t.artists}", max(spare, 10), 0),
+        (t.duration or "?", 5, C_ARTIST),
+        (t.video_id, 11, C_DIM),
+    ]
+
+
+def _queue_segments(i: int, t: Track, width: int) -> list[tuple[str, int, int]]:
+    spare = width - (3 + 1 + 5)
+    return [
+        (f"{i:>2}", 3, C_DIM),
+        (f"{t.title} — {t.artists}", max(spare, 10), 0),
+        (t.duration or "?", 5, C_ARTIST),
+    ]
+
+
+def _history_segments(i: int, e: HistoryEntry, width: int) -> list[tuple[str, int, int]]:
+    spare = width - (3 + 1 + 5 + 1 + 16)
+    return [
+        (f"{i:>2}", 3, C_DIM),
+        (f"{e.title} — {e.artists}", max(spare, 10), 0),
+        (e.duration or "?", 5, C_ARTIST),
+        (format_played_at(e.played_at), 16, C_DIM),
+    ]
+
 
 
 def _current_track(st: State) -> Track:
@@ -451,12 +676,16 @@ def do_queue_load(st: State, path: str | Path | None = None) -> None:
 
 
 def do_search(st: State) -> None:
+    st.loading = True
     st.status = f"Mencari '{st.query}' ..."
+    _refresh(st)
     try:
         st.results = search_tracks(st.query, limit=10)
     except Exception as e:
         st.status = f"Search gagal: {e}"
+        st.loading = False
         return
+    st.loading = False
     st.dirty = False
     st.selected = 0
     st.scroll = 0
@@ -550,6 +779,30 @@ def _refresh_progress(st: State, ipc) -> None:
         pass
 
 
+def _term_title(title: str, st: State) -> None:
+    """Tulis judul window terminal (sekali per perubahan)."""
+    if not title or title == st.term_title:
+        return
+    st.term_title = title
+    if _color():
+        sys.stdout.write(f"\x1b]2;{title}\x07")
+        sys.stdout.flush()
+
+
+def _print_frame(st: State, body: str) -> None:
+    """Cetak layar penuh sekali; lewati bila isinya tak berubah (anti-kedip)."""
+    if body == st.last_frame:
+        return
+    st.last_frame = body
+    print(f"\x1b[2J\x1b[H{body}", end="", flush=True)
+
+
+def _refresh(st: State, term: str = "") -> None:
+    """Render + judul terminal + cetak. Satu pintu untuk semua pembaruan layar."""
+    _term_title(term, st)
+    _print_frame(st, render(st))
+
+
 def _poll_key(timeout: float) -> str | None:
     """Satu tombol dalam timeout detik; None bila tidak ada. Poll player tiap tick."""
     if _WINDOWS:
@@ -589,8 +842,9 @@ def do_play(st: State, keep_queue: bool = False) -> None:
                 prefetch_stream(nxt.video_id)  # hangatkan cache selagi lagu berjalan
             except Exception:
                 pass
+        st.loading = True
         st.status = f"Mengambil stream {track.title} ..."
-        print(f"\x1b[2J\x1b[H{render(st)}", end="", flush=True)
+        _refresh(st)
         try:
             url = resolve_stream_url(track.video_id)
             use_mpv = os.path.basename(player_cmd(url)[0]).lower().startswith("mpv")
@@ -621,8 +875,10 @@ def do_play(st: State, keep_queue: bool = False) -> None:
                     ipc = None  # lanjut tanpa volume control
                     st.mpv_msg = str(e) or "IPC mpv tak terbentuk"
         except Exception as e:
+            st.loading = False
             st.status = f"Gagal memutar: {e}"
             return
+        st.loading = False
         st.playing = f"{track.title} — {track.artists}"
         st.paused = False
         st.status = f"Memutar {track.title} ..."
@@ -634,12 +890,12 @@ def do_play(st: State, keep_queue: bool = False) -> None:
         except Exception:
             pass
 
-        print(f"\x1b[2J\x1b[H{render(st)}", end="", flush=True)
+        _refresh(st, f"{track.title} — {track.artists} | ytmusic-cli")
         nav: str | None = None  # 'next' | 'prev' | 'stop' | 'removed' | None(=lagu habis → autoplay)
         try:
             while proc.poll() is None:
                 _refresh_progress(st, ipc)
-                print(f"\x1b[2J\x1b[H{render(st)}", end="", flush=True)
+                _refresh(st, f"{track.title} — {track.artists} | ytmusic-cli")
                 key = _poll_key(1.0)
                 if key is None:
                     continue  # tick progres: tidak ada tombol, lagu masih jalan
@@ -691,7 +947,7 @@ def do_play(st: State, keep_queue: bool = False) -> None:
                     break
                 else:
                     continue  # tombol tak dikenal: abaikan, jangan hentikan lagu
-                print(f"\x1b[2J\x1b[H{render(st)}", end="", flush=True)
+                _refresh(st, f"{track.title} — {track.artists} | ytmusic-cli")
         finally:
             stop_player(proc)
             if ipc is not None:
@@ -740,7 +996,7 @@ def run_tui() -> int:
     print("\x1b[?25l", end="", flush=True)  # sembunyikan kursor
     try:
         while True:
-            print(f"\x1b[2J\x1b[H{render(st)}", end="", flush=True)
+            _refresh(st, "ytmusic-cli")
             try:
                 action = handle_key(st, read_key())
             except KeyboardInterrupt:
@@ -770,10 +1026,12 @@ def run_tui() -> int:
             elif action == "queueplay":
                 do_play(st, keep_queue=True)
             elif action == "search":
-                print(f"\x1b[2J\x1b[H{render(st)}", end="", flush=True)
                 do_search(st)
             elif action == "play":
                 do_play(st)
     finally:
-        print("\x1b[?25h", end="", flush=True)  # kembalikan kursor
+        st.playing = None
+        st.last_frame = ""
+        _term_title("", st)
+        print("\x1b[?25h\x1b[0m", end="", flush=True)  # kembalikan kursor + warna
     return 0
