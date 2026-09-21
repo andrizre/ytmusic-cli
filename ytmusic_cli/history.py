@@ -148,6 +148,32 @@ def clear_history(path: str | Path | None = None) -> None:
         pass
 
 
+def remove_history(
+    video_id: str, path: str | Path | None = None
+) -> tuple[list[HistoryEntry], bool]:
+    """Hapus SEMUA entri riwayat untuk video_id (dedupe berarti maks. 1).
+    Kembalikan (isi baru, ada-yang-dihapus). Tak ada file = (False, [])."""
+    entries = load_history(path)
+    remaining = [e for e in entries if e.video_id != video_id]
+    if len(remaining) == len(entries):
+        return entries, False
+    save_history(remaining, path)
+    return remaining, True
+
+
+def remove_history_at(
+    index: int, path: str | Path | None = None
+) -> tuple[list[HistoryEntry], HistoryEntry | None]:
+    """Hapus entri pada indeks 0-based (urutan tampilan: terbaru-dulu).
+    Kembalikan (isi baru, entri yang dihapus atau None bila indeks tak valid)."""
+    entries = load_history(path)
+    if not 0 <= index < len(entries):
+        return entries, None
+    gone = entries.pop(index)
+    save_history(entries, path)
+    return entries, gone
+
+
 def format_played_at(ts: float, now: float | None = None) -> str:
     """'2026-09-12 10:30' + embel 'kemarin' / 'N hari lalu' bila relevan."""
     try:
@@ -178,6 +204,55 @@ def queue_file(path: str | Path | None = None) -> Path:
     if override:
         return Path(override).expanduser()
     return _cache_dir() / "queue.json"
+
+
+def settings_file(path: str | Path | None = None) -> Path:
+    """Lokasi file pengaturan (volume yang diingat, dll). Env menimpa default."""
+    if path is not None:
+        return Path(path).expanduser()
+    override = os.environ.get("YTMUSIC_CLI_SETTINGS_FILE")
+    if override:
+        return Path(override).expanduser()
+    return _cache_dir() / "settings.json"
+
+
+def load_settings(path: str | Path | None = None) -> dict:
+    """Baca pengaturan; file hilang/rusak → {}. Nilai default selalu terisi."""
+    try:
+        raw = json.loads(settings_file(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        raw = {}
+    settings = {"volume": 100}  # default
+    if isinstance(raw, dict):
+        vol = raw.get("volume")
+        try:
+            settings["volume"] = max(0, min(int(str(vol)), 130))
+        except (TypeError, ValueError):
+            pass
+    return settings
+
+
+def save_settings(settings: dict, path: str | Path | None = None) -> Path:
+    """Tulis pengaturan atomis. Hanya simpan kunci yang dikenal + valid."""
+    out: dict[str, object] = {}
+    try:
+        out["volume"] = max(0, min(int(settings.get("volume", 100)), 130))
+    except (TypeError, ValueError):
+        out["volume"] = 100
+    f = settings_file(path)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    tmp = f.with_suffix(".tmp")
+    tmp.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, f)
+    return f
+
+
+def remember_volume(volume: int, path: str | Path | None = None) -> None:
+    """Catat volume terkini ke settings.json (best-effort: gagal = diam)."""
+    try:
+        save_settings({"volume": volume}, path)
+    except Exception:
+        pass
 
 
 def _queue_track_from_dict(d: dict) -> Track | None:

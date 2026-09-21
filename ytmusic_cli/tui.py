@@ -1,12 +1,13 @@
 """TUI stdlib-only untuk ytmusic-cli (Windows + POSIX).
 
 Kontrol: ketik query + Enter = cari | ↑↓ = pilih | Enter = putar antrean dari posisi terpilih |
-Ctrl+R = riwayat (↑↓ pilih, Enter putar) | spasi = jeda/lanjut | n/p = next/prev |
+Ctrl+R = riwayat (↑↓ pilih, Enter putar, x hapus entri, C hapus semua) | spasi = jeda/lanjut | n/p = next/prev |
 s = acak | r = ulangi (mati → semua → satu) |
 -/+ = volume (butuh mpv) | ←/→ = seek -5/+5 dtk (butuh mpv) |
 q / Esc = berhenti | Esc di daftar = keluar.
 Ctrl+Q = panel antrean (↑↓ pilih, Enter putar, x hapus, u/d susun, S simpan, L muat) |
 Ctrl+A = tambah lagu terpilih ke antrean | x saat memutar = hapus lagu kini.
+Volume diingat antar trek dan antar sesi (settings.json).
 """
 
 import os
@@ -23,9 +24,13 @@ from .models import Track, format_track
 from .history import (
     HistoryEntry,
     add_history,
+    clear_history,
     format_history_entry,
     load_history,
     load_queue,
+    load_settings,
+    remember_volume,
+    remove_history_at,
     save_queue,
 )
 from .player import MpvIpc, player_cmd, resolve_stream_url, resume_process, start_player, stop_player, suspend_process
@@ -80,21 +85,23 @@ class State:
     status: str = "Ketik query + Enter untuk mencari."
     playing: str | None = None  # judul lagu yang sedang diputar
     paused: bool = False
-    volume: int | None = None  # 0-130 (mpv) atau None bila tak diketahui
+    volume: int = 100  # volume mpv yang diingat antar trek dan antar sesi (0-130)
+    volume_control: bool = False  # True bila mpv IPC aktif (volume/seek bisa dipakai)
     mpv_msg: str | None = None  # alasan IPC mpv gagal (None bila mpv tak dipakai / OK)
     history: list[HistoryEntry] = field(default_factory=list)  # riwayat putar (cache 30 hari / 30 lagu)
-    show_history: bool = False  # panel riwayat aktif (Ctrl+R): ↑↓ + Enter putar
+    show_history: bool = False  # panel riwayat aktif (Ctrl+R): ↑↓ + Enter putar, x hapus, C bersihkan
     show_queue: bool = False  # panel antrean aktif (Ctrl+Q): ↑↓ + Enter/x/u/d/S/L
     queue: list[Track] = field(default_factory=list)  # antrean aktif: daftar asal putar
     queue_pos: int = 0  # indeks lagu yang sedang diputar di queue
     shuffle: bool = False  # acak lagu berikut (tombol s saat memutar)
     repeat: RepeatMode = "off"  # mode ulangi (tombol r saat memutar)
+    settings_path: str | None = None  # lokasi settings.json (diisi run_tui; None = default)
     position: float | None = None  # detik berjalan (mpv time-pos)
     duration: float | None = None  # durasi detik (mpv duration)
 
 
 def handle_key(st: State, key: str) -> str:
-    """Logika murni: ubah state dari satu tombol. Kembalikan aksi: '', 'search', 'play', 'queueplay', 'history', 'queue', 'qadd', 'qdel', 'qmoveup', 'qmovedown', 'qsave', 'qload', 'quit'."""
+    """Logika murni: ubah state dari satu tombol. Kembalikan aksi: '', 'search', 'play', 'queueplay', 'history', 'queue', 'qadd', 'qdel', 'qmoveup', 'qmovedown', 'qsave', 'qload', 'hdel', 'hclear', 'quit'."""
     if key == CTRL_R:
         return "history"
     if key == CTRL_Q:
@@ -121,6 +128,12 @@ def handle_key(st: State, key: str) -> str:
             return "qsave"
         if op == "l":
             return "qload"
+    if st.show_history and len(key) == 1:
+        op = key.lower()
+        if op == "x":
+            return "hdel"
+        if op == "c":
+            return "hclear"
     if st.show_history:
         n = len(st.history)
     elif st.show_queue:
@@ -255,7 +268,7 @@ def render(st: State) -> str:
         bar = progress_bar(st.position, st.duration)
         if bar:
             out.append(bar)
-        if st.volume is not None:
+        if st.volume_control:
             out.append(f"Volume: {volume_bar(st.volume)}   ( - / + | ←/→ seek )")
             out.append("(spasi=jeda | n/p=next/prev | s=acak | r=ulangi | x=hapus | -/+=volume | ←/→=seek 5 dtk | q=berhenti)")
         elif st.mpv_msg:
@@ -271,7 +284,7 @@ def render(st: State) -> str:
         else:
             out.append("(antrean kosong — Ctrl+A tambah dari hasil, L muat simpanan)")
     elif st.show_history:
-        out.append(f"Riwayat terakhir ({len(st.history)}) — ↑↓ pilih, Enter putar:")
+        out.append(f"Riwayat terakhir ({len(st.history)}) — ↑↓ pilih, Enter putar, x hapus, C bersihkan:")
         for i, h in enumerate(st.history[st.scroll : st.scroll + rows], start=st.scroll):
             line = format_history_entry(i + 1, h)
             out.append(f"\x1b[7m{line}\x1b[0m" if i == st.selected else line)
@@ -316,7 +329,37 @@ def do_history(st: State) -> None:
     st.show_history = True
     st.selected = 0
     st.scroll = 0
-    st.status = f"{len(st.history)} lagu di riwayat — ↑↓ pilih, Enter putar."
+    st.status = f"{len(st.history)} lagu di riwayat — ↑↓ pilih, Enter putar, x hapus, C bersihkan."
+
+
+def do_history_delete(st: State, path: str | Path | None = None) -> None:
+    """Hapus entri riwayat terpilih (x di panel Ctrl+R). Panel tetap terbuka."""
+    if not st.show_history or not st.history or not 0 <= st.selected < len(st.history):
+        return
+    try:
+        entries, gone = remove_history_at(st.selected, path)
+    except Exception as e:
+        st.status = f"Gagal menghapus riwayat: {e}"
+        return
+    if gone is None:
+        return
+    st.history = entries
+    st.selected = min(st.selected, len(st.history) - 1) if st.history else 0
+    clamp_scroll(st)
+    st.status = f"Dihapus dari riwayat: {gone.title}."
+
+
+def do_history_clear(st: State, path: str | Path | None = None) -> None:
+    """Bersihkan seluruh riwayat (C di panel Ctrl+R). Panel tetap terbuka."""
+    try:
+        clear_history(path)
+    except Exception as e:
+        st.status = f"Gagal menghapus riwayat: {e}"
+        return
+    st.history = []
+    st.selected = 0
+    st.scroll = 0
+    st.status = "Riwayat dibersihkan."
 
 
 def do_queue(st: State) -> None:
@@ -465,7 +508,8 @@ def _toggle_pause(st: State, proc, ipc) -> None:
 def _change_volume(st: State, ipc, delta: int) -> None:
     # Volume = volume milik proses mpv (per-aplikasi, master Windows tak tersentuh).
     # ffplay tidak punya API remote apa pun → butuh mpv.
-    if ipc is None:
+    # Nilai diingat di state (dipakai trek berikutnya) + settings.json (sesi lain).
+    if not st.volume_control or ipc is None:
         if st.mpv_msg:
             st.status = f"Volume gagal: {st.mpv_msg} — putar ulang."
         else:
@@ -474,13 +518,14 @@ def _change_volume(st: State, ipc, delta: int) -> None:
     try:
         ipc.command("add", "volume", delta)  # return-nya null → baca ulang
         st.volume = int(ipc.get_property("volume"))
+        remember_volume(st.volume, st.settings_path)
     except Exception as e:
         st.status = f"Volume gagal: {e}"
 
 
 def _seek(st: State, ipc, delta: int) -> None:
     # Seek = perintah mpv via IPC; ffplay tak punya remote control.
-    if ipc is None:
+    if not st.volume_control or ipc is None:
         if st.mpv_msg:
             st.status = f"Seek gagal: {st.mpv_msg} — putar ulang."
         else:
@@ -549,19 +594,29 @@ def do_play(st: State, keep_queue: bool = False) -> None:
         try:
             url = resolve_stream_url(track.video_id)
             use_mpv = os.path.basename(player_cmd(url)[0]).lower().startswith("mpv")
-            ipc_path = (r"\\.\pipe\ytmusic-%d" % os.getpid()) if use_mpv else None
+            ipc_path = ("\\\\.\\pipe\\ytmusic-%d" % os.getpid()) if use_mpv else None
             if ipc_path and not _WINDOWS:
-                ipc_path = tempfile.gettempdir() + "/ytmusic-%d.sock" % os.getpid()
-            proc = start_player(url, ipc_path)
+                ipc_path = tempfile.gettempdir() + "/ytmusic-%d.sock" % os.getpid()  # type: ignore[attr-defined]
+            # Volume diingat: teruskan ke mpv lewat --volume agar trek baru
+            # LANGSUNG mulai pada volume yang dipilih (bukan 100% sebentar).
+            # st.volume dibawa dari trek sebelumnya / settings.json; bila IPC
+            # mpv gagal, kita pasang dari --volume saja.
+            proc = start_player(url, ipc_path, st.volume)
             ipc = None
-            st.volume = None
             st.mpv_msg = None
+            st.volume_control = False
             st.position = None
             st.duration = None
             if ipc_path:  # mpv di platform apa pun → volume per-aplikasi via IPC
                 try:
                     ipc = MpvIpc.connect(ipc_path)
-                    st.volume = int(ipc.get_property("volume"))
+                    if ipc is not None:
+                        # mpv baru saja mulai: terapkan volume yang diingat
+                        # (--volume sudah diatur, tapi ini memastikan bila mpv
+                        # mengabaikannya / volume-max berbeda).
+                        ipc.set_property("volume", st.volume)
+                        st.volume = int(ipc.get_property("volume"))
+                        st.volume_control = True
                 except Exception as e:
                     ipc = None  # lanjut tanpa volume control
                     st.mpv_msg = str(e) or "IPC mpv tak terbentuk"
@@ -668,6 +723,10 @@ def do_play(st: State, keep_queue: bool = False) -> None:
 def run_tui() -> int:
     st = State()
     try:
+        st.volume = int(load_settings(st.settings_path).get("volume", 100))
+    except Exception:
+        pass
+    try:
         st.history = load_history()
     except Exception:
         st.history = []
@@ -690,6 +749,10 @@ def run_tui() -> int:
                 return 0
             if action == "history":
                 do_history(st)
+            elif action == "hdel":
+                do_history_delete(st)
+            elif action == "hclear":
+                do_history_clear(st)
             elif action == "queue":
                 do_queue(st)
             elif action == "qadd":

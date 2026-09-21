@@ -228,10 +228,18 @@ def _resolve_mpv() -> str | None:
     return shutil.which("mpv")
 
 
-def player_cmd(stream_url: str) -> list[str]:
+def player_cmd(stream_url: str, volume: int | None = None) -> list[str]:
+    """Susun perintah player. volume (0-130) hanya dipakai untuk mpv: diteruskan
+    lewat --volume agar trek baru langsung mulai pada volume yang diingat
+    (bunci 0-100: option mpv di atas volume-max default akan ditolak; nilai
+    lebih tinggi tetap bisa dicapai lewat IPC 'add' saat runtime)."""
     mpv = _resolve_mpv()
     if mpv:
-        return [mpv, "--no-video", stream_url]
+        cmd = [mpv, "--no-video"]
+        if volume is not None:
+            cmd.append(f"--volume={max(0, min(int(volume), 100))}")
+        cmd.append(stream_url)
+        return cmd
     if shutil.which("ffplay"):
         return ["ffplay", "-nodisp", "-autoexit", stream_url]
     raise RuntimeError(
@@ -356,9 +364,12 @@ def stop_player(proc: subprocess.Popen, timeout: float = 5) -> None:
                     pass
 
 
-def start_player(stream_url: str, ipc_path: str | None = None) -> subprocess.Popen:
-    """Luncurkan player tanpa mewarisi stdio (untuk TUI). Tambah IPC server bila mpv."""
-    cmd = player_cmd(stream_url)
+def start_player(
+    stream_url: str, ipc_path: str | None = None, volume: int | None = None
+) -> subprocess.Popen:
+    """Luncurkan player tanpa mewarisi stdio (untuk TUI). Tambah IPC server bila mpv.
+    volume meneruskan ke --volume mpv (lihat player_cmd)."""
+    cmd = player_cmd(stream_url, volume)
     if ipc_path and os.path.basename(cmd[0]).lower().startswith("mpv"):
         cmd = [cmd[0], f"--input-ipc-server={ipc_path}", *cmd[1:]]
     proc = subprocess.Popen(

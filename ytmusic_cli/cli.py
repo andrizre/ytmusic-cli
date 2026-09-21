@@ -20,6 +20,12 @@ def build_parser() -> argparse.ArgumentParser:
     ph = sub.add_parser("history", help="Lihat riwayat putar (cache 30 hari / 30 lagu)")
     ph.add_argument("-n", "--limit", type=int, default=30, help="Jumlah entri (default 30)")
     ph.add_argument("--clear", action="store_true", help="Hapus riwayat")
+    ph.add_argument(
+        "--remove",
+        metavar="N",
+        type=int,
+        help="Hapus entri nomor N (lihat dari output 'ytmusic history'), 1 = terbaru",
+    )
     ph.add_argument("--json", action="store_true", help="Output JSON")
 
     sub.add_parser("tui", help="Mode interaktif (ketik query, pilih, putar)")
@@ -50,7 +56,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "history":
         from dataclasses import asdict as _asdict
 
-        from .history import clear_history, format_history_entry, load_history
+        from .history import (
+            clear_history,
+            format_history_entry,
+            load_history,
+            remove_history_at,
+        )
 
         if args.clear:
             try:
@@ -65,6 +76,18 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as e:
             print(f"Gagal membaca riwayat: {e}", file=sys.stderr)
             return 1
+        if args.remove is not None:
+            idx = args.remove - 1  # nomor tampilan (1-based) → indeks 0-based
+            try:
+                _, gone = remove_history_at(idx)
+            except Exception as e:
+                print(f"Gagal menghapus entri: {e}", file=sys.stderr)
+                return 1
+            if gone is None:
+                print(f"Entri nomor {args.remove} tidak ada (1-{len(entries)}).", file=sys.stderr)
+                return 1
+            print(f"Dihapus dari riwayat: {gone.title} — {gone.artists} [{gone.video_id}]")
+            return 0
         shown = entries[: max(args.limit, 0)]
         if args.json:
             import json as _json

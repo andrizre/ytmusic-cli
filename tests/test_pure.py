@@ -1,5 +1,6 @@
 """Tes fungsi murni ytmusic-cli (stdlib only, tanpa network/proses Audio)."""
 
+import json
 import os
 import subprocess
 import sys
@@ -31,9 +32,15 @@ from ytmusic_cli.history import (
     format_history_entry,
     load_history,
     load_queue,
+    load_settings,
     prune_history,
     queue_file,
+    remember_volume,
+    remove_history,
+    remove_history_at,
     save_queue,
+    save_settings,
+    settings_file,
 )
 from ytmusic_cli.tui import (
     BACKSPACE,
@@ -52,6 +59,8 @@ from ytmusic_cli.tui import (
     clamp_scroll,
     cycle_repeat,
     do_history,
+    do_history_clear,
+    do_history_delete,
     do_queue,
     do_queue_add,
     do_queue_delete,
@@ -353,6 +362,231 @@ class HistoryTest(unittest.TestCase):
             self.assertEqual(load_history(p), [])
 
 
+class HistoryRemoveTest(unittest.TestCase):
+    def _seed(self, d: str) -> str:
+        p = f"{d}/history.json"
+        add_history(_track(1), path=p)
+        add_history(_track(2), path=p)
+        add_history(_track(3), path=p)  # terbaru → di depan
+        return p
+
+    def test_remove_at_hapus_satu(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._seed(d)
+            entries, gone = remove_history_at(0, p)
+            self.assertIsNotNone(gone)
+            self.assertEqual(gone.video_id, "vid00000003")
+            self.assertEqual([e.video_id for e in entries], ["vid00000002", "vid00000001"])
+            self.assertEqual([e.video_id for e in load_history(p)], ["vid00000002", "vid00000001"])
+
+    def test_remove_at_hapus_terakhir_dan_tersimpan(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._seed(d)
+            entries, gone = remove_history_at(2, p)
+            self.assertEqual(gone.video_id, "vid00000001")
+            self.assertEqual(len(entries), 2)
+
+    def test_remove_at_indeks_negatif_ditolak(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._seed(d)
+            entries, gone = remove_history_at(-1, p)
+            self.assertIsNone(gone)
+            self.assertEqual(len(entries), 3)  # tak berubah
+
+    def test_remove_at_lewat_akhir_ditolak(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._seed(d)
+            _, gone = remove_history_at(99, p)
+            self.assertIsNone(gone)
+
+    def test_remove_video_id(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._seed(d)
+            entries, removed = remove_history("vid00000002", p)
+            self.assertTrue(removed)
+            self.assertEqual([e.video_id for e in entries], ["vid00000003", "vid00000001"])
+
+    def test_remove_video_id_tak_ada_false(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._seed(d)
+            _, removed = remove_history("tak-ada", p)
+            self.assertFalse(removed)
+
+    def test_panel_x_hapus_entri_dipilih(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = f"{d}/history.json"
+            old = os.environ.get("YTMUSIC_CLI_HISTORY_FILE")
+            os.environ["YTMUSIC_CLI_HISTORY_FILE"] = p
+            try:
+                add_history(_track(1), path=p)
+                add_history(_track(2), path=p)
+                add_history(_track(3), path=p)
+                st = State()
+                do_history(st)
+                self.assertEqual(len(st.history), 3)
+                self.assertEqual(handle_key(st, "x"), "hdel")
+                do_history_delete(st)
+                self.assertEqual(len(st.history), 2)
+                self.assertNotIn("vid00000003", [e.video_id for e in st.history])
+                self.assertTrue(st.show_history)  # panel tetap terbuka
+                self.assertIn("Dihapus", st.status)
+                self.assertEqual(len(load_history(p)), 2)
+            finally:
+                if old is None:
+                    os.environ.pop("YTMUSIC_CLI_HISTORY_FILE", None)
+                else:
+                    os.environ["YTMUSIC_CLI_HISTORY_FILE"] = old
+
+    def test_panel_x_hapus_terakhir_lalu_kosong(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = f"{d}/history.json"
+            old = os.environ.get("YTMUSIC_CLI_HISTORY_FILE")
+            os.environ["YTMUSIC_CLI_HISTORY_FILE"] = p
+            try:
+                add_history(_track(5), path=p)
+                st = State()
+                do_history(st)
+                do_history_delete(st)
+                self.assertEqual(st.history, [])
+                self.assertEqual(st.selected, 0)
+                self.assertIn("Dihapus", st.status)
+            finally:
+                if old is None:
+                    os.environ.pop("YTMUSIC_CLI_HISTORY_FILE", None)
+                else:
+                    os.environ["YTMUSIC_CLI_HISTORY_FILE"] = old
+
+    def test_panel_c_bersihkan_semua(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = f"{d}/history.json"
+            old = os.environ.get("YTMUSIC_CLI_HISTORY_FILE")
+            os.environ["YTMUSIC_CLI_HISTORY_FILE"] = p
+            try:
+                add_history(_track(1), path=p)
+                add_history(_track(2), path=p)
+                st = State()
+                do_history(st)
+                self.assertEqual(handle_key(st, "c"), "hclear")
+                do_history_clear(st)
+                self.assertEqual(st.history, [])
+                self.assertTrue(st.show_history)
+                self.assertIn("dibersihkan", st.status)
+                self.assertEqual(load_history(p), [])
+            finally:
+                if old is None:
+                    os.environ.pop("YTMUSIC_CLI_HISTORY_FILE", None)
+                else:
+                    os.environ["YTMUSIC_CLI_HISTORY_FILE"] = old
+
+    def test_hapus_diluar_panel_diam_saja(self):
+        # do_history_* di luar panel riwayat tidak melakukan apa-apa ke state
+        st = State(history=[HistoryEntry("v1", "T", "A", None, None, 0.0)])
+        do_history_delete(st)
+        self.assertEqual(len(st.history), 1)
+        self.assertEqual(st.status, "Ketik query + Enter untuk mencari.")
+
+    def test_handle_key_panel_riwayat_lain_tidak_memicu(self):
+        # 'x' di panel antrean = qdel, bukan hdel
+        st = State(queue=[_track(1)], show_queue=True)
+        self.assertEqual(handle_key(st, "x"), "qdel")
+        # 'x' saat memutar = remove lagu, bukan hdel
+        self.assertEqual(playing_action("x"), "remove")
+
+
+class SettingsVolumeTest(unittest.TestCase):
+    def test_default_file_kosong(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = f"{d}/settings.json"
+            self.assertEqual(load_settings(p), {"volume": 100})
+
+    def test_file_rusak_kembali_default(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = f"{d}/settings.json"
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("{rusak")
+            self.assertEqual(load_settings(p), {"volume": 100})
+
+    def test_simpan_muat_bulat(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = f"{d}/settings.json"
+            save_settings({"volume": 75}, p)
+            self.assertEqual(load_settings(p), {"volume": 75})
+
+    def test_volume_dijepit_0_130(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = f"{d}/settings.json"
+            save_settings({"volume": 999}, p)
+            self.assertEqual(load_settings(p), {"volume": 130})
+            save_settings({"volume": -50}, p)
+            self.assertEqual(load_settings(p), {"volume": 0})
+
+    def test_volume_invalid_kembali_default(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = f"{d}/settings.json"
+            with open(p, "w", encoding="utf-8") as f:
+                f.write('{"volume": "bukan angka"}')
+            self.assertEqual(load_settings(p), {"volume": 100})
+
+    def test_remember_volume_hanya_volume_yang_disimpan(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = f"{d}/settings.json"
+            remember_volume(42, p)
+            with open(p, encoding="utf-8") as f:
+                raw = json.load(f)
+            self.assertEqual(raw, {"volume": 42})
+
+    def test_env_override_lokasi(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = f"{d}/custom.json"
+            old = os.environ.get("YTMUSIC_CLI_SETTINGS_FILE")
+            os.environ["YTMUSIC_CLI_SETTINGS_FILE"] = p
+            try:
+                self.assertEqual(settings_file(), Path(p))
+                remember_volume(60)
+                self.assertEqual(load_settings(), {"volume": 60})
+            finally:
+                if old is None:
+                    os.environ.pop("YTMUSIC_CLI_SETTINGS_FILE", None)
+                else:
+                    os.environ["YTMUSIC_CLI_SETTINGS_FILE"] = old
+
+    def test_state_memuat_volume_dari_settings(self):
+        # run_tui memuat settings.json; di sini disimulasikan lewat load_settings
+        with tempfile.TemporaryDirectory() as d:
+            p = f"{d}/settings.json"
+            remember_volume(80, p)
+            st = State()
+            st.volume = int(load_settings(p).get("volume", 100))
+            self.assertEqual(st.volume, 80)
+
+    def test_render_volume_memakai_state(self):
+        st = State(playing="Judul 1 — Artis", volume=75, volume_control=True)
+        out = render(st)
+        self.assertIn("[", out)
+        self.assertIn("75", out)
+
+
+class PlayerCmdVolumeTest(unittest.TestCase):
+    def test_mpv_volume_flag_diteruskan(self):
+        from ytmusic_cli.player import player_cmd
+
+        cmd = player_cmd("https://x/audio", 75)
+        self.assertIn("--volume=75", cmd)
+        self.assertEqual(cmd[-1], "https://x/audio")
+
+    def test_mpv_tanpa_volume_tak_ada_flag(self):
+        from ytmusic_cli.player import player_cmd
+
+        cmd = player_cmd("https://x/audio")
+        self.assertFalse(any(a.startswith("--volume=") for a in cmd))
+
+    def test_mpv_volume_dijepit_100(self):
+        from ytmusic_cli.player import player_cmd
+
+        cmd = player_cmd("https://x/audio", 130)
+        self.assertIn("--volume=100", cmd)
+
+
 
 class HistoryModeTest(unittest.TestCase):
     def setUp(self):
@@ -394,9 +628,10 @@ class HistoryModeTest(unittest.TestCase):
     def test_ketik_dan_esc_keluar_dari_mode(self):
         st = State()
         do_history(st)
-        handle_key(st, "x")
+        handle_key(st, "a")  # ketik biasa menutup panel (x di panel = hapus entri)
         self.assertFalse(st.show_history)
         self.assertTrue(st.dirty)
+        self.assertEqual(st.query, "a")
         do_history(st)
         self.assertEqual(handle_key(st, ESC), "")
         self.assertFalse(st.show_history)
