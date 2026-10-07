@@ -573,25 +573,66 @@ class SettingsVolumeTest(unittest.TestCase):
 
 
 class PlayerCmdVolumeTest(unittest.TestCase):
-    def test_mpv_volume_flag_diteruskan(self):
-        from ytmusic_cli.player import player_cmd
+    def _cmd(self, volume):
+        from ytmusic_cli import player as p
 
-        cmd = player_cmd("https://x/audio", 75)
+        old = p._resolve_mpv
+        p._resolve_mpv = lambda: "/usr/bin/mpv"  # deterministik: CI tak punya mpv
+        try:
+            return p.player_cmd("https://x/audio", volume)
+        finally:
+            p._resolve_mpv = old
+
+    def test_mpv_volume_flag_diteruskan(self):
+        cmd = self._cmd(75)
         self.assertIn("--volume=75", cmd)
         self.assertEqual(cmd[-1], "https://x/audio")
 
     def test_mpv_tanpa_volume_tak_ada_flag(self):
-        from ytmusic_cli.player import player_cmd
-
-        cmd = player_cmd("https://x/audio")
-        self.assertFalse(any(a.startswith("--volume=") for a in cmd))
+        self.assertFalse(any(a.startswith("--volume=") for a in self._cmd(None)))
 
     def test_mpv_volume_dijepit_100(self):
-        from ytmusic_cli.player import player_cmd
+        self.assertIn("--volume=100", self._cmd(130))
 
-        cmd = player_cmd("https://x/audio", 130)
-        self.assertIn("--volume=100", cmd)
 
+
+class HistoryPlayCliTest(unittest.TestCase):
+    def test_target_valid_dan_invalid(self):
+        from ytmusic_cli.cli import history_play_target
+
+        entries = [
+            HistoryEntry("vid00000001", "T1", "A", None, None, 0.0),
+            HistoryEntry("vid00000002", "T2", "A", None, None, 0.0),
+        ]
+        self.assertEqual(history_play_target(entries, 1), ("vid00000001", entries[0]))
+        self.assertEqual(history_play_target(entries, 2), ("vid00000002", entries[1]))
+        self.assertEqual(history_play_target(entries, 0), (None, None))
+        self.assertEqual(history_play_target(entries, 3), (None, None))
+        self.assertEqual(history_play_target([], 1), (None, None))
+
+    def test_play_tidak_bisa_gabung_clear_remove(self):
+        from ytmusic_cli.cli import main
+
+        self.assertEqual(main(["history", "--play", "1", "--clear"]), 1)
+        self.assertEqual(main(["history", "--play", "1", "--remove", "1"]), 1)
+
+    def test_play_nomor_tak_ada(self):
+        import ytmusic_cli.history as _h
+
+        old = _h.history_file
+        _h.history_file = lambda p=None: Path("/nonexistent/hx.json")
+        try:
+            from ytmusic_cli.cli import main
+
+            self.assertEqual(main(["history", "--play", "1"]), 1)
+        finally:
+            _h.history_file = old
+
+    def test_parser_punya_flag_play(self):
+        from ytmusic_cli.cli import build_parser
+
+        args = build_parser().parse_args(["history", "--play", "3"])
+        self.assertEqual(args.play, 3)
 
 
 class HistoryModeTest(unittest.TestCase):

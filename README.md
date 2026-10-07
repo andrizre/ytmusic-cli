@@ -31,6 +31,7 @@ ytmusic play <videoId|URL>  # putar audio (Ctrl-C berhenti)
 ytmusic play "ado usu"      # kata kunci: pilih nomor hasil, --first langsung putar #1
 ytmusic history [-n 5]      # lihat riwayat putar (cache 30 hari / 30 lagu)
 ytmusic history --remove 2  # hapus entri nomor 2 (1 = terbaru)
+ytmusic history --play 1    # putar ulang entri nomor 1 dari riwayat (tercatat lagi)
 ytmusic history --clear     # hapus seluruh riwayat
 ytmusic history --json      # riwayat sebagai JSON
 ytmusic doctor              # cek mpv/ffplay, yt-dlp, ytmusicapi, lokasi riwayat

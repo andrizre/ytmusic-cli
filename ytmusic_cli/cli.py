@@ -1,9 +1,20 @@
 import argparse
 import sys
 
+from .history import HistoryEntry
 from .models import format_track
 from .player import play_with_metadata
 from .search import search_tracks
+
+
+def history_play_target(
+    entries: list[HistoryEntry], n: int
+) -> tuple[str | None, HistoryEntry | None]:
+    """Nomor tampilan 1-based di riwayat → (video_id, entri); (None, None) bila tak valid."""
+    if not 1 <= n <= len(entries):
+        return None, None
+    e = entries[n - 1]
+    return e.video_id, e
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -26,6 +37,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Hapus entri nomor N (lihat dari output 'ytmusic history'), 1 = terbaru",
     )
+    ph.add_argument(
+        "--play",
+        metavar="N",
+        type=int,
+        help="Putar ulang entri nomor N dari riwayat (1 = terbaru) lalu catat lagi",
+    )
     ph.add_argument("--json", action="store_true", help="Output JSON")
 
     sub.add_parser("tui", help="Mode interaktif (ketik query, pilih, putar)")
@@ -41,6 +58,11 @@ def main(argv: list[str] | None = None) -> int:
         from .tui import run_tui
 
         return run_tui()
+    if args.command == "history" and getattr(args, "play", None) is not None and (
+        args.clear or args.remove is not None
+    ):
+        print("--play tidak bisa digabung dengan --clear/--remove.", file=sys.stderr)
+        return 1
     if args.command == "search":
         try:
             tracks = search_tracks(args.query, limit=args.limit)
@@ -71,6 +93,33 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             print("Riwayat dihapus.")
             return 0
+        if args.play is not None:
+            if args.clear or args.remove is not None:
+                print("--play tidak bisa digabung dengan --clear/--remove.", file=sys.stderr)
+                return 1
+            try:
+                entries = load_history()
+            except Exception as e:
+                print(f"Gagal membaca riwayat: {e}", file=sys.stderr)
+                return 1
+            vid, ent = history_play_target(entries, args.play)
+            if vid is None or ent is None:
+                print(f"Entri nomor {args.play} tidak ada (1-{len(entries)}).", file=sys.stderr)
+                return 1
+            print(f"Memutar dari riwayat: {ent.title} — {ent.artists} [{vid}]", file=sys.stderr)
+            try:
+                rc, track = play_with_metadata(vid)
+            except Exception as e:
+                print(f"Gagal memutar: {e}", file=sys.stderr)
+                return 1
+            if rc == 0:
+                try:
+                    from .history import add_history
+
+                    add_history(track)
+                except Exception:
+                    pass
+            return rc
         try:
             entries = load_history()
         except Exception as e:
